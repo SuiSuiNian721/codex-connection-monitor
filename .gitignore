@@ -1,0 +1,12 @@
+*.log
+*.log.*
+*.state.json
+/VpnRecoveryHelper.exe
+/macOS/native-launcher/codex-proxy-launcher*
+/releases/
+/backups/
+/diagnostics/
+__pycache__/
+runtime-packages/
+.env
+.env.*
