@@ -4,9 +4,9 @@
 
 这套 Windows 启动器把启动前的代理检查、运行环境缓存准备和启动后的连接监测接在一起，减少看不见进度的等待和反复重启。
 
-[![介绍视频封面](media/poster.png)](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.01/introduction-xiaoyi.mp4)
+[![介绍视频封面](media/poster.png)](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.02/introduction-xiaoyi.mp4)
 
-**[下载完整 Windows 分享包](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.01/Codex-Connection-Monitor-Windows-20261001.zip)** · [观看晓伊介绍视频](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.01/introduction-xiaoyi.mp4) · [中文字幕](media/subtitles.srt)
+**[下载完整 Windows 分享包](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.02/Codex-Connection-Monitor-Windows-20261002.zip)** · [观看晓伊介绍视频](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.02/introduction-xiaoyi.mp4) · [中文字幕](media/subtitles.srt)
 
 ## 它改善哪些体验
 
@@ -21,14 +21,14 @@
 ## 使用方法
 
 1. 安装 PowerShell 7，并确认终端可以运行 `pwsh.exe`。
-2. 安装 Microsoft Store 版 Codex，完成自己的登录。
+2. 安装并登录 Codex；自动查找适用于当前 Windows 账户下已注册的 `OpenAI.Codex` 应用包，不要求一定从 Microsoft Store 下载。未注册的安装版或便携版还需确认路径和运行环境兼容性。
 3. 打开自己的代理客户端，启用系统代理，确认本机 HTTP/HTTPS 或 mixed 端口可用。
 4. 解压分享包到自己可写的目录，双击 `启动 Codex（代理）.cmd`。
 5. 等待终端显示准备进度。Codex 启动后，连接监测器在后台运行；Codex 退出后监测器结束。
 
 首次使用时，若 Codex 已经打开，启动器会保留现有进程。需要应用这次代理设置时，先保存工作并正常退出 Codex，再使用此入口启动。
 
-本包已包含自包含的 Windows `VpnRecoveryHelper.exe`，使用分享包无需安装 Go、Node 或 Python。Codex 应用、账户、代理线路与 PowerShell 7 需要自行准备。
+本包已包含自包含的 Windows `VpnRecoveryHelper.exe`，使用分享包无需安装 Go、Node 或 Python。Codex 应用、账户、代理线路与 PowerShell 7 需要自行准备。新版介绍视频在结尾前演示首次准备、完整解压并双击、日常启动这三段操作，片尾感谢观看与使用。视频单独提供，ZIP 不包含视频素材。
 
 ## 连接恢复的实际边界
 
@@ -45,7 +45,7 @@
 `package-manifest.json` 列出包内文件、大小与 SHA-256；Release 提供 `CHECKSUMS.sha256`。在 PowerShell 7 中可以核对下载文件：
 
 ```powershell
-Get-FileHash -LiteralPath '.\Codex-Connection-Monitor-Windows-20261001.zip' -Algorithm SHA256
+Get-FileHash -LiteralPath '.\Codex-Connection-Monitor-Windows-20261002.zip' -Algorithm SHA256
 ```
 
 ## 源码与验证
