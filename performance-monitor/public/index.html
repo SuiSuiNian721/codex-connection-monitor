@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Codex · 后台性能监测</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到监测内容</a>
+    <div class="page-shell">
+      <header class="page-header">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">C</span><span>CODEX <span class="brand-divider">/</span> LOCAL MONITOR</span></div>
+        <div class="connection"><span class="status-dot" id="connection-dot" aria-hidden="true"></span><span id="connection-label" role="status">正在连接本地采集器</span></div>
+      </header>
+
+      <main id="main">
+        <section class="intro" aria-labelledby="page-title">
+          <div>
+            <p class="eyebrow">清楚地看见每一次响应</p>
+            <h1 id="page-title">后台性能监测<span class="title-dot">.</span></h1>
+            <p class="intro-copy">查看网络各环节的检测结果，以及本地会话记录中的耗时与用量。顶部状态仅表示页面与本地采集器的连接，不代表外网连接正常。</p>
+          </div>
+          <div class="refresh-area">
+            <button class="button button-secondary" id="refresh-button" type="button"><span aria-hidden="true">↻</span> 刷新状态</button>
+            <p class="small muted" id="updated-at">每秒读取后台状态</p>
+          </div>
+        </section>
+
+        <div class="notice notice-error" id="connection-error" role="alert" hidden></div>
+        <noscript><p class="notice notice-error">请启用 JavaScript，以查看后台采集结果。</p></noscript>
+
+        <section class="network-section" aria-labelledby="network-title">
+          <div class="section-heading">
+            <div><p class="eyebrow">01 / 分步检测</p><h2 id="network-title">网络连接诊断</h2></div>
+            <span class="quiet-tag" id="network-updated-at">正在准备检测</span>
+          </div>
+          <p class="section-description">页面每秒读取结果，各环节按后台检测频率更新。旧结果不会作为当前正常的依据；token 没有更新也不代表断网。</p>
+          <div class="network-diagnosis network-tone-unknown" id="network-diagnosis" role="status">
+            <span class="network-badge" id="network-confidence">信息不足</span>
+            <div><h3 id="network-summary">正在准备网络检测</h3><p id="network-advice">等待后台返回本地网络、代理、VPN 出口和 OpenAI 路径的检测结果。</p></div>
+          </div>
+          <div class="network-context" id="network-context"></div>
+          <div class="network-grid" id="network-stages"></div>
+          <p class="network-boundary small muted">对照目标可能经过不同的 VPN 路由。访问 OpenAI 超时只能说明这条路径未完成；HTTP 403、429 或 5xx 会单独显示，不能仅凭这些响应认定断网或 OpenAI 服务故障。</p>
+          <details class="network-history source-details"><summary>最近状态变化 <span class="muted" id="network-history-count">0 条</span></summary><ol id="network-history" class="network-history-list"><li>暂无状态变化记录。</li></ol></details>
+        </section>
+
+        <section class="telemetry-section" aria-labelledby="telemetry-title">
+          <div class="section-heading">
+            <div><p class="eyebrow">02 / 被动采集</p><h2 id="telemetry-title">最近一轮表现</h2></div>
+            <div class="filter-field"><label for="model-filter">查看模型</label><select id="model-filter"><option value="">全部模型</option></select></div>
+          </div>
+          <p class="section-description" id="latest-turn-label">等待本地会话记录；没有记录时，指标显示为“—”。</p>
+          <div class="metrics-grid">
+            <article class="metric-card"><p class="metric-label">首 token 耗时</p><p class="metric-value" id="metric-ttft">—</p><p class="metric-footnote">来源记录的首 token 等待时间</p></article>
+            <article class="metric-card"><p class="metric-label">输出 token</p><p class="metric-value" id="metric-output">—</p><p class="metric-footnote">当前轮次记录的输出用量</p></article>
+            <article class="metric-card"><p class="metric-label">推理 token</p><p class="metric-value" id="metric-reasoning">—</p><p class="metric-footnote">日志未提供时不作估算</p></article>
+            <article class="metric-card metric-accent"><p class="metric-label">整轮平均吞吐</p><p class="metric-value" id="metric-throughput">—</p><p class="metric-footnote">token / 秒 · 整轮口径</p></article>
+          </div>
+          <div class="measurement-note"><span class="info-mark" aria-hidden="true">i</span><p><strong>整轮平均吞吐包含思考、工具等待和网络时间，不是实时纯生成速度。</strong>首 token 耗时不是网络延迟；缺少可观测时间或 token 记录时显示“—”。</p></div>
+
+          <div class="speed-grid" aria-label="文字输出速度">
+            <article class="card speed-card">
+              <div class="speed-heading"><h3>消息输出阶段均速</h3><span class="quiet-tag">完成后更新</span></div>
+              <p class="metric-value" id="metric-message-speed">—</p>
+              <p class="metric-footnote">字符 / 秒 · 当前轮次最近一条已完成消息</p>
+              <p class="speed-description" id="message-speed-description">本轮尚无可计算的已完成文字消息。</p>
+            </article>
+            <article class="card speed-card live-speed-card">
+              <div class="speed-heading"><h3>实时输出接收速度</h3><span class="quiet-tag" id="generation-status" role="status">等待采集状态</span></div>
+              <p class="metric-value" id="metric-live-speed">—</p>
+              <p class="metric-footnote">字符 / 秒 · 最近 3 秒的客户端接收窗口</p>
+              <p class="speed-description" id="live-speed-description">等待实时采集状态。</p>
+              <p class="small muted" id="generation-capture-note" hidden></p>
+              <p class="small muted" id="generation-updated-at">尚无采集时间</p>
+            </article>
+          </div>
+          <p class="generation-boundary small muted" id="generation-boundary">两种速度按文字的 Unicode 字符数统计，可能包含输出期间的网络等待，不是服务端纯生成速度，也不是 token/s。消息均速优先采用最终回答；实时流按会话和轮次匹配模型，未知模型单独标明。</p>
+          <details class="source-details generation-details"><summary>实时会话记录 <span class="muted" id="generation-stream-count">0 条</span></summary><ul class="generation-stream-list" id="generation-streams"><li>等待实时采集状态。</li></ul></details>
+
+          <div class="card trend-card">
+            <div class="card-heading"><div><h3>同模型吞吐趋势</h3><p class="small muted" id="trend-caption">等待同一模型的轮次记录</p></div><span class="quiet-tag">最近 12 轮</span></div>
+            <div id="trend-container" class="trend-container"></div>
+            <p class="small muted">从左到右为较早到较新的轮次；缺失值保留空缺。不同模型不混合比较。</p>
+          </div>
+
+          <div class="card records-card">
+            <div class="card-heading"><div><h3>最近轮次</h3><p class="small muted">只展示日志中的指标与标识，不展示聊天正文。</p></div><span class="quiet-tag" id="record-count">0 条</span></div>
+            <div class="table-scroll" tabindex="0" role="region" aria-label="最近轮次表，可横向滚动">
+              <table class="turn-table">
+                <caption class="sr-only">按开始时间倒序排列的最近 50 个轮次</caption>
+                <thead><tr><th scope="col">开始时间 / 状态</th><th scope="col">模型 / 推理强度</th><th scope="col">首 token</th><th scope="col">输出 token</th><th scope="col">推理 token</th><th scope="col">整轮耗时</th><th scope="col">平均 token/s</th><th scope="col">消息均速 字符/s</th></tr></thead>
+                <tbody id="turn-rows"><tr><td colspan="8" class="empty-cell">等待采集记录</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+          <details class="source-details"><summary>采集来源与提示 <span id="source-summary" class="muted">等待后台状态</span></summary><div id="source-warnings" class="source-content"></div></details>
+        </section>
+
+      </main>
+      <footer class="page-footer"><p>本地采集 · 页面每秒读取状态 · 关闭此页面不影响后台采集</p><p id="service-info">Codex Monitor</p></footer>
+    </div>
+  </body>
+</html>

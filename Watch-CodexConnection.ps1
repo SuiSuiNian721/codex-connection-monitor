@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][int]$RootProcessId,
     [Parameter(Mandatory = $true)][string]$CodexExecutable,
     [Parameter(Mandatory = $true)][string]$InitialProxyUri,
+    [string]$RelayStatePath,
     [ValidateSet('System', 'Explicit')][string]$ProxyMode = 'System',
     [int]$OutageSeconds = 180,
     [int]$RecoverySeconds = 15,
@@ -83,6 +84,10 @@ $mutex = $null
 try {
     if ($PollSeconds -lt 1) { throw 'PollSeconds must be at least 1.' }
     if ($VpnAssistCooldownSeconds -lt 1) { throw 'VpnAssistCooldownSeconds must be at least 1.' }
+    if ($RelayStatePath) {
+        try { Import-Module (Join-Path $scriptRoot 'CodexProxyRelay.psm1') -Force }
+        catch { Write-WatchdogLog '无法加载 relay 状态读取器；继续观察固定客户端入口，暂停 VPN 辅助。' 'WARN' }
+    }
 
     $rootProcess = Get-Process -Id $RootProcessId -ErrorAction SilentlyContinue
     if (-not $rootProcess) {
@@ -110,8 +115,11 @@ try {
     $lastVpnAssistAt = [datetime]::MinValue
     $vpnFailureSince = $null
     $lastVpnFailureProxy = ''
+    $lastSystemProxyKey = $null
+    $lastRelayRouteKey = $null
 
-    Write-WatchdogLog "监视器已启动。RootPID=$RootProcessId Proxy=$InitialProxyUri Mode=$ProxyMode"
+    $initialEndpoint = ([uri]$InitialProxyUri).GetLeftPart([UriPartial]::Authority) -replace '://[^/@]+@', '://'
+    Write-WatchdogLog "监视器已启动。RootPID=$RootProcessId ClientProxy=$initialEndpoint Mode=$ProxyMode Relay=$([bool]$RelayStatePath)"
     Write-WatchdogLog '探测策略 v2：超时 8 秒；正常或持续故障时每 30 秒探测。HTTP 响应仅证明传输可达，不验证登录、模型或上下文压缩接口。'
     Write-WatchdogLog '监视器仅记录网络状态并等待客户端自然恢复，不关闭或重新启动 GPT。'
     if (-not $NoVpnAssist) {
@@ -124,7 +132,53 @@ try {
         $now = Get-Date
         if (-not $rootAlive) { break }
 
-        $proxyUri = Get-CurrentSystemProxyUri
+        # 进程的代理参数不会随着注册表变化；固定入口始终来自本次启动参数。
+        $proxyUri = $InitialProxyUri
+        if ($ProxyMode -eq 'System') {
+            $systemProxyUri = Get-CurrentSystemProxyUri
+            $systemProxyKey = [string]$systemProxyUri
+            if (-not $RelayStatePath -and $systemProxyUri -ine $proxyUri -and $systemProxyKey -cne $lastSystemProxyKey) {
+                $systemEndpoint = if ($systemProxyUri) { ([uri]$systemProxyUri).GetLeftPart([UriPartial]::Authority) -replace '://[^/@]+@', '://' } else { '(none)' }
+                $clientEndpoint = ([uri]$proxyUri).GetLeftPart([UriPartial]::Authority) -replace '://[^/@]+@', '://'
+                Write-WatchdogLog "系统代理与当前客户端入口不一致：ClientProxy=$clientEndpoint SystemProxy=$systemEndpoint。此旧会话未使用 relay，需正常退出并重新打开 GPT 才会应用新入口；继续检查当前客户端入口。" 'WARN'
+            }
+            $lastSystemProxyKey = $systemProxyKey
+        }
+
+        $upstreamProxyUri = $proxyUri
+        $relayReady = $true
+        $relayStatus = $null
+        if ($RelayStatePath) {
+            try { $relayStatus = Get-CodexProxyRelayStatus -StatePath $RelayStatePath -ExpectedClientProxyUri $InitialProxyUri }
+            catch { $relayStatus = [pscustomobject]@{ Known = $false; Ready = $false; ErrorKind = 'StatusReadFailure' } }
+            $relayReady = $null -ne $relayStatus -and $relayStatus.Known -and $relayStatus.Ready -and
+                $relayStatus.ClientProxyUri -ieq $InitialProxyUri -and -not [string]::IsNullOrWhiteSpace([string]$relayStatus.UpstreamProxyUri)
+            $upstreamProxyUri = if ($relayReady) { [string]$relayStatus.UpstreamProxyUri } else { '' }
+            $relayRouteKey = "$($relayStatus.Known)|$relayReady|$upstreamProxyUri|$($relayStatus.InstanceId)|$($relayStatus.ProcessId)"
+            if ($relayRouteKey -cne $lastRelayRouteKey) {
+                # 同一固定入口切换上游后，旧上游的 HTTP 结果不能作为新链路的证明。
+                if ($null -ne $lastRelayRouteKey -and $state.Status -in @('RecoveryPending', 'RecoveryEvaluationRequested')) {
+                    $state.Status = 'Outage'
+                    $state.RecoverySince = $null
+                    $state.PendingProxyUri = $null
+                }
+                $lastInternetProbeAt = [datetime]::MinValue
+                $lastInternetResult = $null
+                $lastInternetHealthy = $false
+                $lastProbedProxyUri = $null
+                $vpnFailureSince = $null
+                $lastVpnFailureProxy = ''
+                $clientEndpoint = ([uri]$proxyUri).GetLeftPart([UriPartial]::Authority) -replace '://[^/@]+@', '://'
+                if ($relayReady) {
+                    $upstreamEndpoint = ([uri]$upstreamProxyUri).GetLeftPart([UriPartial]::Authority) -replace '://[^/@]+@', '://'
+                    Write-WatchdogLog "relay 路由已核对：ClientProxy=$clientEndpoint UpstreamProxy=$upstreamEndpoint；固定客户端入口保持不变，新上游的传输状态需重新探测。"
+                }
+                else {
+                    Write-WatchdogLog "relay 状态不可确认或尚未就绪：ClientProxy=$clientEndpoint；继续检查该入口，暂停 VPN 辅助，不把 HTTP 响应判作已核对的链路恢复。" 'WARN'
+                }
+                $lastRelayRouteKey = $relayRouteKey
+            }
+        }
         $localHealthy = $false
         if ($proxyUri) {
             $localHealthy = Test-LocalProxy -ProxyUri $proxyUri -TimeoutMilliseconds 1500
@@ -150,17 +204,18 @@ try {
         }
 
         $now = Get-Date
-        $probeKind = if (-not $proxyUri) { 'SystemProxyUnavailable' }
-            elseif (-not $localHealthy) { 'LocalProxyUnavailable' }
+        $probeKind = if (-not $localHealthy) { 'LocalProxyUnavailable' }
+            elseif (-not $relayReady) { 'RelayUnavailable' }
             elseif ($null -ne $lastInternetResult) { $lastInternetResult.Kind }
             else { 'NotProbed' }
         $httpStatus = if ($null -ne $lastInternetResult) { [string]$lastInternetResult.HttpStatus } else { '' }
-        $diagnosticKey = "$proxyUri|$probeKind|$httpStatus"
-        $diagnosticWarning = -not $lastInternetHealthy -or $probeKind -in @('RateLimited', 'ServerError')
+        $diagnosticKey = "$proxyUri|$upstreamProxyUri|$probeKind|$httpStatus"
+        $diagnosticWarning = -not $relayReady -or -not $lastInternetHealthy -or $probeKind -in @('RateLimited', 'ServerError')
         if ($diagnosticKey -cne $lastDiagnosticKey -or
             ($diagnosticWarning -and ($now - $lastDiagnosticAt).TotalSeconds -ge 300)) {
             $proxyEndpoint = if ($proxyUri) { ([uri]$proxyUri).GetLeftPart([UriPartial]::Authority) -replace '://[^/@]+@', '://' } else { '(none)' }
-            $detail = "代理探测：Proxy=$proxyEndpoint ProbeKind=$probeKind HTTP=$httpStatus"
+            $upstreamEndpoint = if ($upstreamProxyUri) { ([uri]$upstreamProxyUri).GetLeftPart([UriPartial]::Authority) -replace '://[^/@]+@', '://' } else { '(unknown)' }
+            $detail = "代理探测：ClientProxy=$proxyEndpoint UpstreamProxy=$upstreamEndpoint ProbeKind=$probeKind HTTP=$httpStatus"
             if ($null -ne $lastInternetResult) {
                 $detail += " Target=$($lastInternetResult.TargetHost) ElapsedMs=$($lastInternetResult.ElapsedMilliseconds) ErrorType=$($lastInternetResult.ErrorType) SocketError=$($lastInternetResult.SocketErrorCode)"
             }
@@ -169,7 +224,7 @@ try {
             $lastDiagnosticAt = $now
         }
 
-        $isHealthy = $localHealthy -and $lastInternetHealthy -and
+        $isHealthy = $relayReady -and $localHealthy -and $lastInternetHealthy -and
             ($now - $lastInternetProbeAt).TotalSeconds -le ([Math]::Max(15, $probeIntervalSeconds + $PollSeconds))
         $update = Update-ConnectionWatchState -State $state -IsHealthy $isHealthy -ProxyUri ([string]$proxyUri) -Now $now -OutageSeconds $OutageSeconds -RecoverySeconds $RecoverySeconds
         $state = $update.State
@@ -177,30 +232,42 @@ try {
         if ($update.Action -eq 'LongOutageDetected') {
             Write-WatchdogLog "代理传输探测连续失败 $OutageSeconds 秒（ProbeKind=$probeKind）；保持 GPT 进程不变，等待后续探测。" 'WARN'
             if (-not $localHealthy) {
-                Write-WatchdogLog '本地 VPN 代理端口未监听；不能通过切远端节点修复，未启动或重载 VPN。' 'WARN'
+                Write-WatchdogLog '固定客户端代理入口未监听；不能通过切远端节点修复，未启动或重载 VPN。' 'WARN'
             }
         }
         elseif ($update.Action -eq 'EvaluateRecovery') {
-            if ($state.RecoveryReason -eq 'ProxyChanged') {
-                Write-WatchdogLog "Windows 系统代理已稳定切换到 $proxyUri，检查 GPT 是否已自然连接新端口。"
-            }
-            else {
-                Write-WatchdogLog "代理传输探测连续通过 $RecoverySeconds 秒，检查 GPT 到本地代理的 TCP 连接；这不代表模型接口已恢复。"
-            }
+            Write-WatchdogLog "代理传输探测连续通过 $RecoverySeconds 秒，检查 GPT 到固定客户端入口的 TCP 连接；这不代表模型接口已恢复。"
         }
 
         if (-not $NoVpnAssist) {
             $vpnFailureSince = Update-VpnTransportFailureSince -FailureSince $vpnFailureSince -Now $now -ProbeKind $probeKind `
-                -LocalProxyHealthy $localHealthy -ProxyUri ([string]$proxyUri) -PreviousProxyUri $lastVpnFailureProxy
-            $lastVpnFailureProxy = [string]$proxyUri
+                -LocalProxyHealthy ($localHealthy -and $relayReady) -ProxyUri ([string]$upstreamProxyUri) -PreviousProxyUri $lastVpnFailureProxy
+            $lastVpnFailureProxy = [string]$upstreamProxyUri
             $vpnAssistDecision = Get-VpnRecoveryDecision -Status $state.Status -FailureSince $vpnFailureSince -Now $now `
                 -OutageSeconds $OutageSeconds -CooldownSeconds $VpnAssistCooldownSeconds -LastAttemptAt $lastVpnAssistAt `
-                -ProbeKind $probeKind -LocalProxyHealthy $localHealthy -ProxyUri ([string]$proxyUri) -ActiveProxyUri $state.ActiveProxyUri
+                -ProbeKind $probeKind -LocalProxyHealthy ($localHealthy -and $relayReady) -ProxyUri ([string]$upstreamProxyUri) -ActiveProxyUri ([string]$upstreamProxyUri)
             if ($vpnAssistDecision.ShouldRun -and (Test-WatchdogRootIdentity -Process (Get-Process -Id $RootProcessId -ErrorAction SilentlyContinue) -ExecutablePath $CodexExecutable -StartedAt $rootStartedAt)) {
-                $lastVpnAssistAt = Get-Date
-                $vpnAssist = Invoke-VpnAutoAssist -ProxyUri $proxyUri -ProbeKind $probeKind -RootProcessId $RootProcessId -RootStartedAt $rootStartedAt
-                Write-WatchdogLog "VPN 长故障辅助：Status=$($vpnAssist.Status) Action=$($vpnAssist.Action) Client=$($vpnAssist.Client)；$($vpnAssist.Message)" `
-                    $(if ($vpnAssist.Status -in @('NativeAutomatic', 'SelectedAutomatic')) { 'INFO' } else { 'WARN' })
+                $upstreamStillVerified = $true
+                if ($RelayStatePath) {
+                    try {
+                        $currentRelay = Get-CodexProxyRelayStatus -StatePath $RelayStatePath -ExpectedClientProxyUri $InitialProxyUri
+                        $upstreamStillVerified = $currentRelay.Known -and $currentRelay.Ready -and
+                            $currentRelay.ClientProxyUri -ieq $InitialProxyUri -and $currentRelay.UpstreamProxyUri -ieq $upstreamProxyUri -and
+                            $currentRelay.InstanceId -ceq $relayStatus.InstanceId -and $currentRelay.ProcessId -eq $relayStatus.ProcessId
+                    }
+                    catch { $upstreamStillVerified = $false }
+                }
+                if ($upstreamStillVerified) {
+                    $lastVpnAssistAt = Get-Date
+                    $vpnAssist = Invoke-VpnAutoAssist -ProxyUri $upstreamProxyUri -ProbeKind $probeKind -RootProcessId $RootProcessId -RootStartedAt $rootStartedAt
+                    Write-WatchdogLog "VPN 长故障辅助：Status=$($vpnAssist.Status) Action=$($vpnAssist.Action) Client=$($vpnAssist.Client)；$($vpnAssist.Message)" `
+                        $(if ($vpnAssist.Status -in @('NativeAutomatic', 'SelectedAutomatic')) { 'INFO' } else { 'WARN' })
+                }
+                else {
+                    $vpnFailureSince = $null
+                    $lastVpnFailureProxy = ''
+                    Write-WatchdogLog 'relay 上游在辅助检查期间发生变化或失联，本轮未执行 VPN 辅助；等待重新核对当前链路。' 'WARN'
+                }
             }
         }
 
@@ -228,14 +295,8 @@ try {
             }
             elseif ($connection.Connected) {
                 $unknownConnectionLogged = $false
-                $recoveryReason = [string]$state.RecoveryReason
                 $state = Complete-ConnectionRecovery -State $state -ProxyUri $proxyUri -Now (Get-Date)
-                if ($recoveryReason -eq 'ProxyChanged') {
-                    Write-WatchdogLog "检测到 GPT 到新系统代理 $proxyUri 的 TCP 连接，继续监视；任务是否恢复需以任务响应为准。"
-                }
-                else {
-                    Write-WatchdogLog '检测到 GPT 到本地代理的 TCP 连接，继续监视；任务是否恢复需以任务响应为准。'
-                }
+                Write-WatchdogLog '检测到 GPT 到本地代理的 TCP 连接（本次启动的固定客户端入口），继续监视；任务是否恢复需以任务响应为准。'
             }
             else {
                 $unknownConnectionLogged = $false

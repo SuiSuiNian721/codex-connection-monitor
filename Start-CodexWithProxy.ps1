@@ -2,6 +2,7 @@
 param(
     [switch]$DryRun,
     [switch]$NoWatchdog,
+    [switch]$NoPerformanceMonitor,
     [string]$ProxyServerOverride,
     [string]$CodexExecutableOverride
 )
@@ -12,6 +13,7 @@ $scriptRoot = Split-Path -Parent $launcherPath
 $logPath = Join-Path $scriptRoot 'launcher.log'
 Import-Module (Join-Path $scriptRoot 'CodexProxyLauncher.psm1') -Force
 Import-Module (Join-Path $scriptRoot 'CuaRuntime.psm1') -Force
+Import-Module (Join-Path $scriptRoot 'CodexProxyRelay.psm1') -Force
 $launchMutex = $null
 $ownsLaunchMutex = $false
 
@@ -41,12 +43,47 @@ function Get-RunningCodexProcesses {
     })
 }
 
+function Initialize-GenerationCollection {
+    param([string]$RealCliPath, [switch]$Disabled)
+
+    # 仅设置本次启动进程的环境，不修改系统或用户环境变量。
+    foreach ($name in @('CODEX_GENERATION_NODE', 'CODEX_GENERATION_SCRIPT', 'CODEX_GENERATION_REAL_CLI',
+            'CODEX_GENERATION_STATE_DIR', 'CODEX_GENERATION_LAUNCH_ID', 'CODEX_GENERATION_HOME_KEY')) {
+        Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    }
+    Set-Item -LiteralPath 'Env:CODEX_CLI_PATH' -Value $RealCliPath
+    if ($Disabled) { return $null }
+    try {
+        Import-Module (Join-Path $scriptRoot 'GenerationBridge.psm1') -Force
+        $generationHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+        $configuration = Get-CodexGenerationConfiguration -RealCliPath $RealCliPath -CodexHome $generationHome -ProjectRoot $scriptRoot
+        Set-Item -LiteralPath 'Env:CODEX_GENERATION_NODE' -Value $configuration.NodeExecutable
+        Set-Item -LiteralPath 'Env:CODEX_GENERATION_SCRIPT' -Value $configuration.ScriptPath
+        Set-Item -LiteralPath 'Env:CODEX_GENERATION_REAL_CLI' -Value $configuration.RealCliPath
+        Set-Item -LiteralPath 'Env:CODEX_GENERATION_STATE_DIR' -Value $configuration.StateDirectory
+        Set-Item -LiteralPath 'Env:CODEX_GENERATION_LAUNCH_ID' -Value $configuration.LaunchId
+        Set-Item -LiteralPath 'Env:CODEX_GENERATION_HOME_KEY' -Value $configuration.HomeKey
+        Set-Item -LiteralPath 'Env:CODEX_CLI_PATH' -Value $configuration.ForwarderPath
+        return $configuration
+    }
+    catch {
+        foreach ($name in @('CODEX_GENERATION_NODE', 'CODEX_GENERATION_SCRIPT', 'CODEX_GENERATION_REAL_CLI',
+                'CODEX_GENERATION_STATE_DIR', 'CODEX_GENERATION_LAUNCH_ID', 'CODEX_GENERATION_HOME_KEY')) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        }
+        Set-Item -LiteralPath 'Env:CODEX_CLI_PATH' -Value $RealCliPath
+        Write-LauncherLog '实时输出采集准备失败；使用原 CLI 继续启动，完成后的消息均速仍可查看。' 'WARN'
+        return $null
+    }
+}
+
 function Start-ConnectionWatchdog {
     param(
         [Parameter(Mandatory = $true)][int]$RootProcessId,
         [Parameter(Mandatory = $true)][string]$CodexExecutable,
         [Parameter(Mandatory = $true)][string]$ProxyUri,
-        [ValidateSet('System', 'Explicit')][string]$ProxyMode = 'System'
+        [ValidateSet('System', 'Explicit')][string]$ProxyMode = 'System',
+        [string]$RelayStatePath
     )
 
     $watchdogPath = Join-Path $scriptRoot 'Watch-CodexConnection.ps1'
@@ -65,6 +102,7 @@ function Start-ConnectionWatchdog {
         '-InitialProxyUri', $ProxyUri,
         '-ProxyMode', $ProxyMode
     )
+    if ($RelayStatePath) { $arguments += @('-RelayStatePath', ('"{0}"' -f $RelayStatePath)) }
     Start-Process -FilePath $powershell -ArgumentList $arguments -WindowStyle Hidden | Out-Null
 }
 
@@ -104,7 +142,10 @@ try {
     Write-Host "Proxy : $proxyUri"
     Write-Host "Codex : $codexExecutable"
 
+    $proxyMode = if ($ProxyServerOverride) { 'Explicit' } else { 'System' }
     if ($DryRun) {
+        $relayPreview = Start-CodexProxyRelay -ProxyMode $proxyMode -InitialProxyUri $proxyUri -DryRun
+        Write-Host "Relay : $($relayPreview.StatePath)（预检，不启动）"
         Write-Host 'DryRun: preflight checks passed; no process was stopped or started.'
         exit 0
     }
@@ -115,7 +156,14 @@ try {
     catch [Threading.AbandonedMutexException] { $ownsLaunchMutex = $true }
     if (-not $ownsLaunchMutex) { throw '另一个启动器正在准备或启动 Codex，请稍候；无需重复点击。' }
     if (@(Get-RunningCodexProcesses -ExecutablePath $codexExecutable -IncludeOtherVersions).Count -gt 0) {
-        Write-Host 'Codex 已经运行，本次未重新启动。若要应用新的代理，请先保存工作并正常退出 Codex。'
+        $existingRelay = Restore-CodexProxyRelay -CodexExecutable $codexExecutable -ProxyMode $proxyMode -InitialProxyUri $proxyUri
+        if ($existingRelay) {
+            Write-Host "Codex 已经运行，固定入口 $($existingRelay.ClientProxyUri) 已就绪；本次未重新启动 Codex。"
+            Write-LauncherLog "Existing Codex relay checked. ClientProxy=$($existingRelay.ClientProxyUri) RelayPID=$($existingRelay.ProcessId)"
+        }
+        else {
+            Write-Host 'Codex 已经运行，本次未重新启动。此旧会话未使用固定入口，正常退出后再通过本启动器打开即可应用修复。'
+        }
         Write-LauncherLog 'Codex is already running; duplicate launch skipped.'
         exit 0
     }
@@ -147,6 +195,11 @@ try {
         exit 0
     }
 
+    $relay = Start-CodexProxyRelay -ProxyMode $proxyMode -InitialProxyUri $proxyUri
+    $proxyUri = $relay.ClientProxyUri
+    Write-Host "客户端固定入口：$proxyUri；VPN 上游：$($relay.UpstreamProxyUri)"
+    Write-LauncherLog "Proxy relay ready. ClientProxy=$proxyUri UpstreamProxy=$($relay.UpstreamProxyUri) Mode=$proxyMode RelayPID=$($relay.ProcessId)"
+
     foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')) {
         Set-Item -Path "Env:$name" -Value $proxyUri
     }
@@ -154,7 +207,7 @@ try {
         Set-Item -Path "Env:$name" -Value 'localhost,127.0.0.1,::1'
     }
 
-    Set-Item -Path 'Env:CODEX_CLI_PATH' -Value $runtimeCli
+    $generationConfiguration = Initialize-GenerationCollection -RealCliPath $runtimeCli -Disabled:$NoPerformanceMonitor
 
     $started = Start-Process -FilePath $codexExecutable -ArgumentList "--proxy-server=$proxyUri" -WorkingDirectory (Split-Path $codexExecutable -Parent) -PassThru
     $startupDeadline = (Get-Date).AddSeconds(20)
@@ -176,12 +229,29 @@ try {
     }
 
     Write-LauncherLog "Codex started with proxy. PID(s)=$($running.Id -join ',')"
+    if ($generationConfiguration) {
+        try {
+            Register-CodexGenerationBinding -Configuration $generationConfiguration -CodexProcess $rootProcess
+            Write-LauncherLog "Realtime output collection bound. RootPID=$($rootProcess.Id)"
+        }
+        catch {
+            Write-LauncherLog '实时输出采集身份注册失败，面板将标明不可核对；Codex 与原连接监测继续运行。' 'WARN'
+        }
+    }
     if (-not $NoWatchdog) {
-        $proxyMode = if ($ProxyServerOverride) { 'Explicit' } else { 'System' }
-        Start-ConnectionWatchdog -RootProcessId $rootProcess.Id -CodexExecutable $codexExecutable -ProxyUri $proxyUri -ProxyMode $proxyMode
+        Start-ConnectionWatchdog -RootProcessId $rootProcess.Id -CodexExecutable $codexExecutable -ProxyUri $proxyUri -ProxyMode $proxyMode -RelayStatePath $relay.StatePath
         Write-LauncherLog "Connection watchdog started. RootPID=$($rootProcess.Id)"
     }
-    Write-Host 'Codex 已通过当前代理启动。'
+    if (-not $NoPerformanceMonitor) {
+        try {
+            $performanceService = & (Join-Path $scriptRoot 'Start-CodexPerformanceMonitor.ps1')
+            Write-LauncherLog "Performance monitor started in background. PID=$($performanceService.ProcessId)"
+        }
+        catch {
+            Write-LauncherLog '性能监测暂未启动；Codex 和原连接监测继续运行，可稍后单独打开性能面板。' 'WARN'
+        }
+    }
+    Write-Host 'Codex 已通过固定本地入口启动；系统代理模式下，新连接会跟随 VPN 上游切换。'
     exit 0
 }
 catch {
