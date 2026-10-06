@@ -50,35 +50,45 @@
 
         <section class="telemetry-section" aria-labelledby="telemetry-title">
           <div class="section-heading">
-            <div><p class="eyebrow">02 / 被动采集</p><h2 id="telemetry-title">最近一轮表现</h2></div>
+            <div><p class="eyebrow">02 / 被动采集</p><h2 id="telemetry-title">按任务查看表现</h2></div>
             <div class="filter-field"><label for="model-filter">查看模型</label><select id="model-filter"><option value="">全部模型</option></select></div>
           </div>
-          <p class="section-description" id="latest-turn-label">等待本地会话记录；没有记录时，指标显示为“—”。</p>
+          <div class="card task-card">
+            <div class="card-heading"><div><h3>任务列表</h3><p class="small muted">按轮次开始时间排序，最多展示 30 条。点击任务固定查看；状态以本地记录为准，未记录结束不等于仍在生成。</p></div><span class="quiet-tag" id="task-count">等待任务</span></div>
+            <div class="task-toolbar" role="search" aria-label="搜索任务列表">
+              <div class="task-search-field"><label for="task-search">搜索任务</label><input id="task-search" type="search" maxlength="160" autocomplete="off" placeholder="会话标题、模型、会话 / 轮次 ID" aria-describedby="task-search-hint"></div>
+              <div class="task-sort-field"><label for="task-sort">时间顺序</label><select id="task-sort"><option value="desc">最新优先</option><option value="asc">最早优先</option></select></div>
+              <button class="button button-secondary" id="task-search-clear" type="button" disabled>清空搜索</button>
+            </div>
+            <p class="task-search-hint small muted" id="task-search-hint">搜索当前采集记录中的任务；更改关键词或模型会重新选择，切换排序保留当前选择。</p>
+            <div class="task-list" id="task-list" aria-label="选择要查看的会话与轮次"><p class="task-empty">等待本地会话记录。</p></div>
+          </div>
+          <p class="section-description selected-task-label" id="latest-turn-label">等待本地会话记录。</p>
           <div class="metrics-grid">
-            <article class="metric-card"><p class="metric-label">首 token 耗时</p><p class="metric-value" id="metric-ttft">—</p><p class="metric-footnote">来源记录的首 token 等待时间</p></article>
+            <article class="metric-card"><p class="metric-label">首 token 耗时</p><p class="metric-value" id="metric-ttft">等待记录</p><p class="metric-footnote" id="ttft-description">来源记录的首 token 等待时间</p></article>
             <article class="metric-card"><p class="metric-label">输出 token</p><p class="metric-value" id="metric-output">—</p><p class="metric-footnote">当前轮次记录的输出用量</p></article>
             <article class="metric-card"><p class="metric-label">推理 token</p><p class="metric-value" id="metric-reasoning">—</p><p class="metric-footnote">日志未提供时不作估算</p></article>
-            <article class="metric-card metric-accent"><p class="metric-label">整轮平均吞吐</p><p class="metric-value" id="metric-throughput">—</p><p class="metric-footnote">token / 秒 · 整轮口径</p></article>
+            <article class="metric-card metric-accent"><p class="metric-label">整轮平均吞吐</p><p class="metric-value" id="metric-throughput">等待记录</p><p class="metric-footnote" id="throughput-description">token / 秒 · 整轮口径</p></article>
           </div>
-          <div class="measurement-note"><span class="info-mark" aria-hidden="true">i</span><p><strong>整轮平均吞吐包含思考、工具等待和网络时间，不是实时纯生成速度。</strong>首 token 耗时不是网络延迟；缺少可观测时间或 token 记录时显示“—”。</p></div>
+          <div class="measurement-note"><span class="info-mark" aria-hidden="true">i</span><p><strong>整轮平均吞吐包含思考、工具等待和网络时间，不是实时纯生成速度。</strong>首 token 耗时不是网络延迟；正在进行的轮次等待完成记录，来源缺少字段时会明确标注。</p></div>
 
           <div class="speed-grid" aria-label="文字输出速度">
             <article class="card speed-card">
               <div class="speed-heading"><h3>消息输出阶段均速</h3><span class="quiet-tag">完成后更新</span></div>
               <p class="metric-value" id="metric-message-speed">—</p>
-              <p class="metric-footnote">字符 / 秒 · 当前轮次最近一条已完成消息</p>
+              <p class="metric-footnote">字符 / 秒 · 所选任务的已完成消息，优先最终回答</p>
               <p class="speed-description" id="message-speed-description">本轮尚无可计算的已完成文字消息。</p>
             </article>
             <article class="card speed-card live-speed-card">
-              <div class="speed-heading"><h3>实时输出接收速度</h3><span class="quiet-tag" id="generation-status" role="status">等待采集状态</span></div>
+              <div class="speed-heading"><h3>3秒平滑接收速度</h3><span class="quiet-tag" id="generation-status" role="status">等待采集状态</span></div>
               <p class="metric-value" id="metric-live-speed">—</p>
-              <p class="metric-footnote">字符 / 秒 · 最近 3 秒的客户端接收窗口</p>
+              <p class="metric-footnote">所选任务最近 3 秒收到的 Unicode 字符数 ÷ 3</p>
               <p class="speed-description" id="live-speed-description">等待实时采集状态。</p>
               <p class="small muted" id="generation-capture-note" hidden></p>
               <p class="small muted" id="generation-updated-at">尚无采集时间</p>
             </article>
           </div>
-          <p class="generation-boundary small muted" id="generation-boundary">两种速度按文字的 Unicode 字符数统计，可能包含输出期间的网络等待，不是服务端纯生成速度，也不是 token/s。消息均速优先采用最终回答；实时流按会话和轮次匹配模型，未知模型单独标明。</p>
+          <p class="generation-boundary small muted" id="generation-boundary">两种速度按文字的 Unicode 字符数统计，可能包含输出期间的网络等待，不是服务端纯生成速度，也不是 token/s。固定 3 秒窗口在开始输出不足 3 秒时会偏低。接收数据约每 250 ms 读取一次，页面处于后台时浏览器可能降低刷新频率；每个任务独立统计。</p>
           <details class="source-details generation-details"><summary>实时会话记录 <span class="muted" id="generation-stream-count">0 条</span></summary><ul class="generation-stream-list" id="generation-streams"><li>等待实时采集状态。</li></ul></details>
 
           <div class="card trend-card">
@@ -101,7 +111,7 @@
         </section>
 
       </main>
-      <footer class="page-footer"><p>本地采集 · 页面每秒读取状态 · 关闭此页面不影响后台采集</p><p id="service-info">Codex Monitor</p></footer>
+      <footer class="page-footer"><p>本地采集 · 接收数据约 250 ms、其余状态约 1 秒刷新 · 关闭此页面不影响后台采集</p><p id="service-info">Codex Monitor</p></footer>
     </div>
   </body>
 </html>

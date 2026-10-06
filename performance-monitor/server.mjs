@@ -5,11 +5,14 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
+export const runtimeRevision = '2026.10.06-panel.2';
+
 const publicDir = fileURLToPath(new URL('./public/', import.meta.url));
 const assets = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/index.html', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/performance-view.mjs', ['performance-view.mjs', 'text/javascript; charset=utf-8']],
   ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
 ]);
 
@@ -24,14 +27,20 @@ function sendJson(res, status, body) {
 }
 
 async function existingService(port, key) {
+  let health;
   try {
     const response = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(800) });
     if (!response.ok) return null;
-    const health = await response.json();
-    if (health.service === 'codex-performance-monitor' && health.version === 1 && health.homeKey === key && Number.isInteger(health.pid)) {
-      return { url: `http://127.0.0.1:${port}/`, port, reused: true, health, close: async () => {} };
+    health = await response.json();
+  } catch { return null; /* 占用端口可能属于别的应用；只识别自己的健康响应。 */ }
+  if (health?.service === 'codex-performance-monitor' && health.version === 1 && health.homeKey === key && Number.isInteger(health.pid)) {
+    if (health.runtimeRevision !== runtimeRevision) {
+      const error = new Error('已有性能监测后台的运行版本与当前程序不一致；请通过启动器核验并更新后台后重试。');
+      error.code = 'ERR_MONITOR_RUNTIME_MISMATCH';
+      throw error;
     }
-  } catch { /* 占用端口可能属于别的应用；只识别自己的健康响应。 */ }
+    return { url: `http://127.0.0.1:${port}/`, port, reused: true, health, close: async () => {} };
+  }
   return null;
 }
 
@@ -67,6 +76,7 @@ export async function startMonitor(options) {
   let stopped = false;
   let backgroundError = null;
   let polling = null;
+  let generationPolling = null;
   let timer;
   let networkTimer;
   let generationTimer;
@@ -88,10 +98,14 @@ export async function startMonitor(options) {
       }
       const url = new URL(req.url, expectedOrigin);
       if (url.pathname === '/api/health' && req.method === 'GET') {
-        sendJson(res, 200, { service: 'codex-performance-monitor', version: 1, pid: process.pid, instanceId, homeKey: key, startedAt, ready });
+        sendJson(res, 200, { service: 'codex-performance-monitor', version: 1, runtimeRevision, pid: process.pid, instanceId, homeKey: key, startedAt, ready });
         return;
       }
       if (!ready) { sendJson(res, 503, { error: '后台采集器正在准备，请稍候。' }); return; }
+      if (url.pathname === '/api/generation' && req.method === 'GET') {
+        sendJson(res, 200, { version: 1, generation: generationCollector.snapshot() });
+        return;
+      }
       if (url.pathname === '/api/status' && req.method === 'GET') {
         const telemetry = collector.snapshot();
         if (backgroundError) telemetry.warnings = [...(telemetry.warnings ?? []), backgroundError];
@@ -127,7 +141,7 @@ export async function startMonitor(options) {
       const existing = await existingService(candidate, key);
       if (existing) {
         await mkdir(stateDir, { recursive: true });
-        await atomicJson(manifestPath, { version: 1, pid: existing.health.pid, port: candidate, url: existing.url,
+        await atomicJson(manifestPath, { version: 1, runtimeRevision, pid: existing.health.pid, port: candidate, url: existing.url,
           instanceId: existing.health.instanceId, homeKey: key, startedAt: existing.health.startedAt });
         delete existing.health;
         return existing;
@@ -151,7 +165,7 @@ export async function startMonitor(options) {
       const { GenerationCollector } = await import('./generation.mjs');
       generationCollector = new GenerationCollector({ stateDir, homeKey: key });
     }
-    await atomicJson(manifestPath, { version: 1, pid: process.pid, port, url: `${origin}/`, instanceId, homeKey: key, startedAt });
+    await atomicJson(manifestPath, { version: 1, runtimeRevision, pid: process.pid, port, url: `${origin}/`, instanceId, homeKey: key, startedAt });
     ready = true;
   } catch (error) {
     server.closeAllConnections();
@@ -177,11 +191,12 @@ export async function startMonitor(options) {
   pollNetwork();
   networkTimer = setInterval(pollNetwork, Math.max(20, options.networkPollMs ?? 1000));
   const pollGeneration = () => {
-    if (stopped) return;
-    Promise.resolve().then(() => generationCollector.poll()).catch(() => {});
+    if (generationPolling || stopped) return;
+    generationPolling = Promise.resolve().then(() => generationCollector.poll()).catch(() => {})
+      .finally(() => { generationPolling = null; });
   };
   pollGeneration();
-  generationTimer = setInterval(pollGeneration, Math.max(20, options.generationPollMs ?? 1000));
+  generationTimer = setInterval(pollGeneration, Math.max(20, options.generationPollMs ?? 250));
   return {
     url: `${origin}/`, port, reused: false,
     async close() {
@@ -191,6 +206,7 @@ export async function startMonitor(options) {
       clearInterval(networkTimer);
       clearInterval(generationTimer);
       await generationCollector.close();
+      await generationPolling;
       await networkCollector.close();
       await polling;
       server.closeAllConnections();
@@ -219,8 +235,8 @@ async function main() {
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
-  main().catch(() => {
-    process.stderr.write('性能监测器启动失败，请检查运行环境与目录权限。\n');
+  main().catch(error => {
+    process.stderr.write(error.code === 'ERR_MONITOR_RUNTIME_MISMATCH' ? `${error.message}\n` : '性能监测器启动失败，请检查运行环境与目录权限。\n');
     process.exitCode = 1;
   });
 }

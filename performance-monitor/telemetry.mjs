@@ -1,6 +1,7 @@
 import { open, opendir, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { SessionTitleReader } from './session-titles.mjs';
 
 const MAX_LINE_BYTES = 256 * 1024;
 const FILE_BUDGET = 1024 * 1024;
@@ -17,12 +18,15 @@ const maximum = (left, right) => left === null ? right : right === null ? left :
 const bounded = (value, fallback, limit) => Number.isInteger(value) && value > 0 ? Math.min(value, limit) : fallback;
 const identity = (info) => `${info.dev}:${info.ino}:${info.birthtimeMs}`;
 const turnKey = (sessionId, turnId) => JSON.stringify([sessionId, turnId]);
+const labelText = (value, limit = 256) => typeof value === 'string'
+  ? [...value.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim()].slice(0, limit).join('') || null : null;
 const metadata = (payload) => ({
   model: identifier(payload.model),
   effort: identifier(payload.effort ?? payload.reasoning_effort),
   provider: identifier(payload.model_provider_id ?? payload.model_provider),
 });
 const epochTimestamp = (value) => count(value) !== null && value <= 8640000000000000 ? new Date(value).toISOString() : null;
+const taskTimestamp = (value) => timestamp(value) ?? (count(value) !== null ? epochTimestamp(value * 1000) : null);
 const messageOrder = (left, right) => Number(right.phase === 'final_answer') - Number(left.phase === 'final_answer')
   || (Date.parse(right.completedAt) || right.observedAt) - (Date.parse(left.completedAt) || left.observedAt)
   || right.observedAt - left.observedAt;
@@ -70,12 +74,14 @@ export class TelemetryCollector {
   #polling = null;
   #sequence = 0;
   #readCursor = 0;
+  #sessionTitles;
 
   constructor({ codexHome, lookbackDays = 3, maxFiles = 80, maxTurns = 200 }) {
     this.#home = resolve(codexHome);
     this.#lookbackDays = bounded(lookbackDays, 3, 31);
     this.#maxFiles = bounded(maxFiles, 80, 500);
     this.#maxTurns = bounded(maxTurns, 200, 2000);
+    this.#sessionTitles = new SessionTitleReader({ codexHome: this.#home });
   }
 
   async poll() {
@@ -104,6 +110,7 @@ export class TelemetryCollector {
     this.#readCursor = start + visited;
     if (visited < candidates.length) this.#warn('已达到单次读取上限，剩余记录将在后续轮询继续读取。');
     this.#trim();
+    await this.#sessionTitles.poll(this.#orderedTurns().flatMap(turn => [turn.sessionId, turn.parentSessionId]));
     this.#updatedAt = new Date().toISOString();
   }
 
@@ -161,7 +168,7 @@ export class TelemetryCollector {
           this.#source.truncatedFiles++;
           this.#warn('检测到会话文件截断或替换，已从文件开头重新识别。');
         }
-        file = { identity: identity(info), offset: 0, anchor: null, skipping: false, oversized: false, sessionId: null, currentTurn: null, active: false, pending: false, settings: {}, headerSeen: false, inheritedHistory: false, historyStart: null };
+        file = { identity: identity(info), offset: 0, anchor: null, skipping: false, oversized: false, sessionId: null, currentTurn: null, active: false, pending: false, settings: {}, displayMetadata: {}, headerSeen: false, inheritedHistory: false, historyStart: null };
         this.#files.set(path, file);
       }
       let position = file.offset;
@@ -247,8 +254,14 @@ export class TelemetryCollector {
         this.#warn('会话头与文件线程归属不一致，已忽略冲突记录。');
         return;
       }
-      if (file.sessionId !== sessionId) { file.currentTurn = null; file.active = false; file.settings = {}; }
+      if (file.sessionId !== sessionId) { file.currentTurn = null; file.active = false; file.settings = {}; file.displayMetadata = {}; }
       file.sessionId = sessionId;
+      // Only the owner header that survived the fork boundary checks may supply
+      // display metadata. Never derive a label from a prompt or copied history.
+      const parentSessionId = identifier(payload.parent_thread_id);
+      const agentLabel = labelText(payload.agent_nickname) ?? labelText(payload.agent_path);
+      if (parentSessionId && parentSessionId !== sessionId) file.displayMetadata.parentSessionId = parentSessionId;
+      if (agentLabel) file.displayMetadata.agentLabel = agentLabel;
       const provider = identifier(payload.model_provider);
       if (provider) file.settings.provider = provider;
       return;
@@ -275,16 +288,18 @@ export class TelemetryCollector {
     const key = turnKey(file.sessionId, id);
     let turn = this.#turns.get(key);
     if (!turn) {
-      turn = { id, sessionId: file.sessionId, startedAt: null, completedAt: null, status: 'running', model: null, effort: null, provider: null, durationMs: null, ttftMs: null, outputTotal: null, reasoningTotal: null, responses: new Map(), responseOverflow: false, messages: new Map(), warnings: new Set(), metadataAt: {}, lastActivity: 0, sequence: ++this.#sequence };
+      turn = { id, sessionId: file.sessionId, parentSessionId: null, agentLabel: null, startedAt: null, completedAt: null, status: 'running', model: null, effort: null, provider: null, durationMs: null, ttftMs: null, outputTotal: null, reasoningTotal: null, responses: new Map(), responseOverflow: false, messages: new Map(), warnings: new Set(), metadataAt: {}, lastActivity: 0, sequence: ++this.#sequence };
       this.#turns.set(key, turn);
     }
+    turn.parentSessionId ??= file.displayMetadata.parentSessionId ?? null;
+    turn.agentLabel ??= file.displayMetadata.agentLabel ?? null;
     turn.lastActivity = Math.max(turn.lastActivity, at ? Date.parse(at) : 0);
     this.#applyMetadata(turn, file.settings, at, true);
     if (kind === 'task_started' || kind === 'turn_context') {
       file.currentTurn = id;
       file.active = turn.status === 'running';
       if (kind === 'task_started') {
-        const startedAt = timestamp(payload.started_at) ?? at;
+        const startedAt = taskTimestamp(payload.started_at) ?? at;
         if (startedAt && (!turn.startedAt || startedAt < turn.startedAt)) turn.startedAt = startedAt;
       } else {
         this.#applyMetadata(turn, metadata(payload), at);
@@ -304,8 +319,8 @@ export class TelemetryCollector {
       }
     } else {
       turn.status = kind === 'task_complete' ? 'completed' : kind === 'task_failed' ? 'failed' : 'interrupted';
-      turn.completedAt = timestamp(payload.completed_at) ?? at ?? turn.completedAt;
-      turn.startedAt ??= timestamp(payload.started_at);
+      turn.completedAt = taskTimestamp(payload.completed_at) ?? at ?? turn.completedAt;
+      turn.startedAt ??= taskTimestamp(payload.started_at);
       turn.durationMs = number(payload.duration_ms) ?? turn.durationMs;
       turn.ttftMs = number(payload.time_to_first_token_ms) ?? turn.ttftMs;
       if (file.currentTurn === id) file.active = false;
@@ -360,6 +375,16 @@ export class TelemetryCollector {
   #warn(message) { if (this.#warnings.size < 16) this.#warnings.add(message); }
   #error(message) { this.#source.errors++; this.#warn(message); }
 
+  #sessionTitle(turn) {
+    const ownTitle = this.#sessionTitles.get(turn.sessionId);
+    if (ownTitle || !turn.agentLabel) return ownTitle;
+    const parentTitle = this.#sessionTitles.get(turn.parentSessionId);
+    if (!parentTitle) return labelText(`子任务 ${turn.agentLabel}`);
+    // Reserve room for the explicit subtask label even when the parent title is long.
+    const suffix = labelText(`子任务 ${turn.agentLabel}`, 252);
+    return `${labelText(parentTitle, 256 - [...suffix].length - 3)} · ${suffix}`;
+  }
+
   snapshot() {
     return {
       updatedAt: this.#updatedAt,
@@ -389,6 +414,7 @@ export class TelemetryCollector {
         if (turn.durationMs === null) warnings.push('来源未提供整轮耗时。');
         return {
           id: turn.id, sessionId: turn.sessionId,
+          sessionTitle: this.#sessionTitle(turn),
           startedAt: turn.startedAt, completedAt: turn.completedAt, status: turn.status,
           model: turn.model, effort: turn.effort, provider: turn.provider,
           outputTokens, reasoningTokens, durationMs: turn.durationMs, ttftMs: turn.ttftMs,

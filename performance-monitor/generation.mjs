@@ -77,7 +77,7 @@ function normalizeItem(raw, now) {
       (completedAt && Date.parse(completedAt) > now + 2000)) return null;
   return { threadId: raw.threadId, turnId: raw.turnId, itemId: raw.itemId,
     phase: ['final_answer', 'commentary'].includes(raw.phase) ? raw.phase : null, state: raw.state,
-    characters, windowCharacters,
+    characters, windowCharacters, partial: raw.partial === true,
     charactersPerSecond: raw.state !== 'completed' && lastDeltaAt ? windowCharacters / 3 : null,
     startedAt, lastDeltaAt, completedAt };
 }
@@ -179,6 +179,7 @@ export class GenerationCollector {
     let activeUpdatedAt = null;
     let latestHealth = null;
     let activeHealth = null;
+    let droppedEvents = 0;
     const streams = new Map();
     for (const candidate of candidates.slice(0, 16)) {
       if (this.closed) return;
@@ -192,6 +193,9 @@ export class GenerationCollector {
             !observed || Date.parse(observed) > this.clock() + 2000 || !Array.isArray(raw.items)) { invalid++; continue; }
         const health = normalizeCaptureHealth(raw.captureHealth);
         if (raw.captureHealth && !health) { invalid++; continue; }
+        const dropped = raw.coverage == null ? 0 : count(raw.coverage.droppedEvents);
+        if (dropped === null) { invalid++; continue; }
+        droppedEvents = Math.min(Number.MAX_SAFE_INTEGER, droppedEvents + dropped);
         if (!updatedAt || observed > updatedAt) { updatedAt = observed; latestHealth = health; }
         const fresh = raw.state === 'active' && (!health || health.state === 'ok') && this.clock() - Date.parse(observed) <= this.staleAfterMs;
         if (fresh && (!activeUpdatedAt || observed > activeUpdatedAt)) { activeUpdatedAt = observed; activeHealth = health; }
@@ -224,7 +228,8 @@ export class GenerationCollector {
     const captureHealth = activeUpdatedAt ? activeHealth : latestHealth;
     if (activeUpdatedAt && captureHealth?.reattachedAt) reason += ' 采集旁路已恢复，累计从恢复后开始，未补算中断时段。';
     else if (activeUpdatedAt && captureHealth?.recoveries) reason += ' 本地快照写入已自动恢复。';
-    this.value = { updatedAt: activeUpdatedAt ?? updatedAt, status, reason, windowMs: 3000, captureHealth, streams: items };
+    if (droppedEvents) reason += ' 活动消息达到保留上限，部分事件未计入；局部采集只包含已观测片段。';
+    this.value = { updatedAt: activeUpdatedAt ?? updatedAt, status, reason, windowMs: 3000, captureHealth, coverage: { droppedEvents }, streams: items };
   }
 
   snapshot() {

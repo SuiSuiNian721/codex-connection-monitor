@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -20,7 +20,7 @@ await mkdir(codexHome);
 const homeKey = createHash('sha256').update(codexHome.toLowerCase()).digest('hex').slice(0, 24);
 const stateDir = path.join(projectRoot, 'runtime', `performance-${homeKey}`);
 const legacyScript = path.join(projectRoot, 'performance-monitor', `generation-bridge.recovery-fixture-${randomBytes(8).toString('hex')}.mjs`);
-const legacyBackup = path.join(projectRoot, 'tests', 'fixtures', 'generation-bridge-before-retry.mjs');
+const legacyBackup = path.join(projectRoot, 'backups', '20261006-generation-retry', 'performance-monitor', 'generation-bridge.mjs');
 const recoverScript = path.join(projectRoot, 'performance-monitor', 'recover-generation.mjs');
 const checks = [];
 let ownsState = false;
@@ -160,16 +160,14 @@ $rows=foreach($ownedId in $wanted){
   assert.equal(byPid[ids.cliPid].parentPid, ids.observerPid);
   checks.push('real-root-native-observer-cli-parent-chain');
   collector = new GenerationCollector({ stateDir, homeKey });
-  service = await startMonitor({ codexHome, stateDir, port: 0, generationPollMs: 100,
-    collector: { async poll() {}, snapshot() { return { turns: [], warnings: [], source: {}, updatedAt: new Date().toISOString() }; } },
-    networkCollector: { async poll() {}, snapshot() { return null; }, async close() {} }, generationCollector: collector });
   const streamDirectory = path.join(config.StateDirectory, config.LaunchId);
   const legacyFiles = await waitFor(async () => (await readdir(streamDirectory)).filter(name => /^stream-\d+-[a-f0-9]{32}\.json$/.test(name)), value => value.length === 1, 'legacy 首次心跳');
   const legacyFile = path.join(streamDirectory, legacyFiles[0]);
   const readLegacy = async () => JSON.parse(await readFile(legacyFile, 'utf8'));
-  const baseline = await readLegacy();
-  assert.equal(baseline.pid, ids.observerPid);
-  await waitFor(readLegacy, value => value.updatedAt !== baseline.updatedAt, 'legacy 心跳先正常更新');
+  // 不提前打开 JSON 读取或后台轮询：旧 writer 会被普通读锁抢先触发冻结，
+  // 从而绕过下面明确、受控的共享锁故障步骤。元数据检查不持有内容读锁。
+  const baseline = await stat(legacyFile);
+  await waitFor(async () => (await stat(legacyFile)).mtimeMs, value => value !== baseline.mtimeMs, 'legacy 心跳先正常更新');
   checks.push('legacy-writer-initially-heartbeats');
 
   const lockScript = path.join(fixtureRoot, 'lock.ps1');
@@ -189,6 +187,7 @@ try {
   lock.child.stdin.end();
   await waitFor(async () => { try { return JSON.parse(await readFile(lockReady, 'utf8')); } catch { return null; } }, value => value?.locked, '只读共享锁已持有');
   const lockedSnapshot = await readLegacy();
+  assert.equal(lockedSnapshot.pid, ids.observerPid);
   await delay(1400);
   assert.equal((await readLegacy()).updatedAt, lockedSnapshot.updatedAt, '锁期间 legacy rename 失败，心跳被冻结');
   await writeFile(lockRelease, 'release', 'utf8');
@@ -249,6 +248,9 @@ $listeners=@(Get-NetTCPConnection -State Listen -OwningProcess $ObserverProcessI
   await waitFor(async () => JSON.parse(await readFile(recoveredFile, 'utf8')), value => value.updatedAt !== recoveredFirst.updatedAt, '恢复后新 writer 心跳继续');
   checks.push('new-writer-heartbeats-on-same-existing-observer');
 
+  service = await startMonitor({ codexHome, stateDir, port: 0, generationPollMs: 100,
+    collector: { async poll() {}, snapshot() { return { turns: [], warnings: [], source: {}, updatedAt: new Date().toISOString() }; } },
+    networkCollector: { async poll() {}, snapshot() { return null; }, async close() {} }, generationCollector: collector });
   native.child.stdin.write('emit\n');
   transcript.push(openingBytes);
   const active = await waitFor(async () => { await collector.poll(); return collector.snapshot(); }, value => value.streams.some(item => item.characters === 6 && item.charactersPerSecond === 2), '热恢复后中文和拆分 emoji 正确计数');

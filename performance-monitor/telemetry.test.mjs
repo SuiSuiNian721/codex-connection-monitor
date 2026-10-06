@@ -52,6 +52,26 @@ test('whole-turn totals and repeated token_count records never double count', as
   assert.match(turn.warnings.join(' '), /端到端.*推理.*工具/);
 });
 
+test('explicit epoch-second task times survive delayed persistence and completion-only records', async (t) => {
+  const { day, collector } = await setup(t);
+  await writeFile(join(day, 'rollout-epoch.jsonl'), jsonl([
+    meta(),
+    event('task_started', { turn_id: 'started-turn', started_at: Date.parse(time(1)) / 1000 }, 2),
+    event('task_complete', { turn_id: 'started-turn', started_at: Date.parse(time(1)) / 1000, completed_at: Date.parse(time(10)) / 1000 }, 12),
+    event('task_complete', { turn_id: 'completion-only', started_at: Date.parse(time(20)) / 1000, completed_at: Date.parse(time(30)) / 1000 }, 32),
+  ]));
+  await collector.poll();
+  const turns = collector.snapshot().turns;
+  const startedTurn = turns.find(turn => turn.id === 'started-turn');
+  assert.equal(startedTurn.startedAt, time(1));
+  assert.equal(startedTurn.completedAt, time(10));
+  const completedTurn = turns.find(turn => turn.id === 'completion-only');
+  assert.equal(completedTurn.startedAt, time(20));
+  assert.equal(completedTurn.completedAt, time(30));
+  assert.equal(completedTurn.durationMs, null, 'epoch endpoints do not synthesize a source duration');
+  assert.equal(completedTurn.ttftMs, null);
+});
+
 test('session and turn identity survive overlapping files and context rotation', async (t) => {
   const { day, collector } = await setup(t);
   await writeFile(join(day, 'rollout-a.jsonl'), jsonl([meta(), started(), context(), usage()]));
@@ -128,10 +148,97 @@ test('snapshot contains only whitelisted metadata and cannot mutate collector st
   await collector.poll();
   const snapshot = collector.snapshot();
   assert.equal(JSON.stringify(snapshot).includes(secret), false);
-  assert.deepEqual(Object.keys(snapshot.turns[0]).sort(), ['id', 'sessionId', 'startedAt', 'completedAt', 'status', 'model', 'effort', 'provider', 'outputTokens', 'reasoningTokens', 'durationMs', 'ttftMs', 'throughputTps', 'messageOutput', 'warnings'].sort());
+  assert.deepEqual(Object.keys(snapshot.turns[0]).sort(), ['id', 'sessionId', 'sessionTitle', 'startedAt', 'completedAt', 'status', 'model', 'effort', 'provider', 'outputTokens', 'reasoningTokens', 'durationMs', 'ttftMs', 'throughputTps', 'messageOutput', 'warnings'].sort());
   snapshot.turns[0].outputTokens = 999;
   assert.equal(collector.snapshot().turns[0].outputTokens, 120);
   assert.equal(await readFile(file, 'utf8'), original);
+});
+
+test('session titles come only from existing title metadata and remain isolated by session', async t => {
+  const { home, day, collector } = await setup(t);
+  await writeFile(join(day, 'rollout-a.jsonl'), jsonl([meta(), started(), usage(), complete()]));
+  await writeFile(join(day, 'rollout-b.jsonl'), jsonl([meta('session-b'), started(), usage('turn-a', 30), complete()]));
+  await writeFile(join(home, 'session_index.jsonl'), jsonl([
+    { id: 'session-a', thread_name: '监测器任务', updated_at: time(1), text: 'PRIVATE_BODY_SENTINEL' },
+  ]));
+  await collector.poll();
+  const turns = collector.snapshot().turns;
+  assert.equal(turns.find(turn => turn.sessionId === 'session-a').sessionTitle, '监测器任务');
+  assert.equal(turns.find(turn => turn.sessionId === 'session-b').sessionTitle, null);
+  assert.equal(turns.find(turn => turn.sessionId === 'session-b').outputTokens, 30);
+  assert.doesNotMatch(JSON.stringify(turns), /PRIVATE_BODY_SENTINEL/);
+  await writeFile(join(home, 'session_index.jsonl'), '{broken JSON');
+  await collector.poll();
+  assert.equal(collector.snapshot().turns.find(turn => turn.sessionId === 'session-a').sessionTitle, null);
+  assert.equal(collector.snapshot().turns.find(turn => turn.sessionId === 'session-a').outputTokens, 120);
+});
+
+test('subtask labels prefer their own title, otherwise combine the parent title and explicit nickname', async t => {
+  const { home, day, collector } = await setup(t);
+  const child = (id, parent, nickname, agentPath) => row('session_meta', {
+    id, parent_thread_id: parent, agent_nickname: nickname, agent_path: agentPath,
+  });
+  await writeFile(join(home, 'session_index.jsonl'), jsonl([
+    { id: 'parent', thread_name: '监测器整理', updated_at: time(1) },
+    { id: 'own-title', thread_name: '已命名任务', updated_at: time(1) },
+  ]));
+  await writeFile(join(day, 'own.jsonl'), jsonl([child('own-title', 'parent', '标题核对'), started(), usage(), complete()]));
+  await writeFile(join(day, 'child.jsonl'), jsonl([child('child', 'parent', '标题核对'), started(), usage(), complete()]));
+  await writeFile(join(day, 'orphan.jsonl'), jsonl([child('orphan', 'missing', '  检查\n界面 '), started(), usage(), complete()]));
+  await writeFile(join(day, 'path.jsonl'), jsonl([child('path-only', null, '', '/root/search_tasks'), started(), usage(), complete()]));
+  await collector.poll();
+  const titles = new Map(collector.snapshot().turns.map(turn => [turn.sessionId, turn.sessionTitle]));
+  assert.equal(titles.get('own-title'), '已命名任务');
+  assert.equal(titles.get('child'), '监测器整理 · 子任务 标题核对');
+  assert.equal(titles.get('orphan'), '子任务 检查 界面');
+  assert.equal(titles.get('path-only'), '子任务 /root/search_tasks');
+  for (const turn of collector.snapshot().turns) {
+    assert.equal(Object.hasOwn(turn, 'parentSessionId'), false);
+    assert.equal(Object.hasOwn(turn, 'agentLabel'), false);
+  }
+});
+
+test('copied and conflicting fork headers cannot rename the owner subtask or leak labels across sessions', async t => {
+  const { home, day, collector } = await setup(t);
+  const indexed = (record, ordinal) => ({ ...record, ordinal });
+  await writeFile(join(home, 'session_index.jsonl'), jsonl([{ id: 'parent', thread_name: '真实父任务', updated_at: time(1) }]));
+  await writeFile(join(day, 'fork.jsonl'), jsonl([
+    indexed(row('session_meta', { id: 'child', session_id: 'parent', parent_thread_id: 'parent',
+      agent_nickname: '正确子任务', forked_from_id: 'parent', subagent_history_start_ordinal: 10 }), 0),
+    indexed(row('session_meta', { id: 'parent', agent_nickname: 'COPIED_LABEL', parent_thread_id: 'wrong' }), 1),
+    indexed(started(), 10),
+    indexed(row('session_meta', { id: 'other', agent_nickname: 'CONFLICTING_LABEL', parent_thread_id: 'wrong' }), 11),
+    indexed(usage(), 12), indexed(complete(), 13),
+  ]));
+  await writeFile(join(day, 'other.jsonl'), jsonl([meta('other'), started(), usage('turn-a', 30), complete()]));
+  await collector.poll();
+  const snapshot = collector.snapshot();
+  assert.equal(snapshot.turns.find(turn => turn.sessionId === 'child').sessionTitle, '真实父任务 · 子任务 正确子任务');
+  assert.equal(snapshot.turns.find(turn => turn.sessionId === 'other').sessionTitle, null);
+  assert.doesNotMatch(JSON.stringify(snapshot), /COPIED_LABEL|CONFLICTING_LABEL/);
+});
+
+test('generated subtask labels stay within 256 Unicode characters while retaining the subtask marker', async t => {
+  const { home, day, collector } = await setup(t);
+  await writeFile(join(home, 'session_index.jsonl'), jsonl([{ id: 'parent', thread_name: '🙂'.repeat(256), updated_at: time(1) }]));
+  await writeFile(join(day, 'child.jsonl'), jsonl([
+    row('session_meta', { id: 'child', parent_thread_id: 'parent', agent_nickname: '并行核对\u0000' }),
+    started(), usage(), complete(),
+  ]));
+  const longNickname = `${'长'.repeat(220)}末尾`;
+  await writeFile(join(day, 'long-nickname.jsonl'), jsonl([
+    row('session_meta', { id: 'long-nickname', parent_thread_id: 'parent', agent_nickname: longNickname }),
+    started(), usage(), complete(),
+  ]));
+  await collector.poll();
+  const turns = collector.snapshot().turns;
+  const title = turns.find(turn => turn.sessionId === 'child').sessionTitle;
+  assert.ok([...title].length <= 256);
+  assert.match(title, /子任务 并行核对/);
+  assert.doesNotMatch(title, /[\x00-\x1f\x7f]/);
+  const longTitle = turns.find(turn => turn.sessionId === 'long-nickname').sessionTitle;
+  assert.ok([...longTitle].length <= 256);
+  assert.ok(longTitle.endsWith(longNickname), '截短父标题时保留完整可容纳的子任务昵称');
 });
 
 test('oversized and malformed lines are bounded and later valid metadata remains readable', async (t) => {

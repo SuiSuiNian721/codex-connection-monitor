@@ -163,6 +163,27 @@ test('本地快照写入恢复有安全诊断，不能暴露任意错误正文�
   }
 });
 
+test('保留上限和局部采集只公开安全字段，不能覆盖采集故障原因', async t => {
+  const f = await fixture(t); await f.bind();
+  const raw = stream();
+  raw.coverage = { droppedEvents: 7, text: 'PRIVATE_COVERAGE_BODY' };
+  raw.items[0].partial = true;
+  await f.write(raw); await f.collector.poll();
+  const active = f.collector.snapshot();
+  assert.deepEqual(active.coverage, { droppedEvents: 7 });
+  assert.equal(active.streams[0].partial, true);
+  assert.equal(active.streams[0].charactersPerSecond, 20);
+  assert.match(active.reason, /保留上限/);
+  assert.doesNotMatch(JSON.stringify(active), /PRIVATE_COVERAGE_BODY/);
+  raw.captureHealth = { state: 'retrying', recoveries: 0, lastErrorCode: 'EPERM', lastErrorStage: 'rename' };
+  await f.write(raw); await f.collector.poll();
+  const unavailable = f.collector.snapshot();
+  assert.equal(unavailable.status, 'unavailable');
+  assert.match(unavailable.reason, /写入失败/);
+  assert.match(unavailable.reason, /保留上限/);
+  assert.equal(unavailable.streams[0].charactersPerSecond, null);
+});
+
 test('只有快照过期时明确定位本地采集心跳，不能混称进程身份过期', async t => {
   const f = await fixture(t); await f.bind(); await f.write(); await f.collector.poll(); f.advance(5001);
   assert.match(f.collector.snapshot().reason, /本地.*快照/);

@@ -153,7 +153,7 @@ input.on('line', command => {
   const initial = await waitFor(readGeneration, value => value.status === 'idle', '默认 PowerShell 身份核对');
   assert.equal(initial.streams.length, 0);
   checks.push('real-generation-reader-default-windows-process-verification');
-  const runtimeModule = process.env.PLAYWRIGHT_MODULE_PATH || (() => { throw new Error('请设置 PLAYWRIGHT_MODULE_PATH，指向自行安装的 playwright/index.mjs。'); })();
+  const runtimeModule = process.env.PLAYWRIGHT_MODULE_PATH || path.join(process.env.USERPROFILE, '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'node', 'node_modules', 'playwright', 'index.mjs');
   const { chromium } = await import(pathToFileURL(runtimeModule).href);
   browser = await chromium.launch({ channel: 'msedge', headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
@@ -238,8 +238,14 @@ $results = foreach ($identity in $identities) {
   assert.equal(completedApi.generation.streams[0].charactersPerSecond, null);
   await writeFile(path.join(outputDir, 'completed-status.json'), JSON.stringify(completedApi, null, 2), 'utf8');
   await page.locator('#refresh-button').click();
-  await page.waitForFunction(() => document.querySelector('#generation-status')?.textContent === '本条已完成');
-  assert.equal(await page.locator('#metric-live-speed').innerText(), '—');
+  await page.waitForFunction(() => document.querySelector('#generation-status')?.textContent === '等待文字输出');
+  assert.equal(await page.locator('#metric-live-speed').innerText(), '等待文字');
+  checks.push('completed-message-does-not-falsely-complete-running-turn');
+  telemetry.turns[0].status = 'completed';
+  telemetry.turns[0].completedAt = new Date().toISOString();
+  await page.locator('#refresh-button').click();
+  await page.waitForFunction(() => document.querySelector('#generation-status')?.textContent === '本轮已完成');
+  assert.equal(await page.locator('#metric-live-speed').innerText(), '已完成');
   await page.locator('.live-speed-card').screenshot({ path: path.join(outputDir, 'completed-speed-card.png') });
   checks.push('real-completion-clears-reader-api-browser-rate');
 

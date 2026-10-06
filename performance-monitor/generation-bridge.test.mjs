@@ -55,6 +55,57 @@ test('split surrogate deltas and very frequent chunks keep accurate bounded coun
   assert.ok(JSON.stringify(collector).length < 30_000, 'retained observer metadata must remain bounded');
 });
 
+test('completed messages cannot evict a still streaming item at the retention boundary', async () => {
+  const { GenerationAccumulator } = await import('./generation-bridge.mjs');
+  const collector = new GenerationAccumulator();
+  collector.observe(started('still-streaming'));
+  collector.observe(delta('abc', 'still-streaming'));
+  for (let index = 0; index < 25; index++) {
+    const itemId = `completed-${index}`;
+    collector.observe(started(itemId, 'other-turn'));
+    collector.observe(notification('item/completed', {
+      threadId: 'thread-1', turnId: 'other-turn', item: { id: itemId, type: 'agentMessage' },
+    }));
+  }
+  collector.observe(delta('def', 'still-streaming'));
+  const snapshot = collector.snapshot();
+  assert.equal(snapshot.length, 20);
+  assert.equal(snapshot.find(item => item.itemId === 'still-streaming')?.characters, 6);
+});
+
+test('a full active retention window preserves existing counts and reports dropped events and partial resumes', async () => {
+  const { GenerationAccumulator } = await import('./generation-bridge.mjs');
+  const collector = new GenerationAccumulator();
+  for (let index = 0; index < 20; index++) {
+    collector.observe(started(`active-${index}`));
+    collector.observe(delta('abc', `active-${index}`));
+  }
+  collector.observe(started('overflow'));
+  collector.observe(delta('unobserved', 'overflow'));
+  collector.observe(started('active-0'));
+  collector.observe(delta('def', 'active-0'));
+  const full = collector.snapshot();
+  assert.equal(full.length, 20);
+  assert.equal(full.find(item => item.itemId === 'active-0')?.characters, 6);
+  assert.equal(full.find(item => item.itemId === 'active-0')?.partial, false);
+  assert.equal(full.some(item => item.itemId === 'overflow'), false);
+  assert.deepEqual(collector.coverage(), { droppedEvents: 2 });
+  collector.observe(notification('item/completed', {
+    threadId: 'thread-1', turnId: 'turn-1', item: { id: 'active-1', type: 'agentMessage' },
+  }));
+  collector.observe(delta('xy', 'overflow'));
+  const resumed = collector.snapshot().find(item => item.itemId === 'overflow');
+  assert.equal(resumed.characters, 2);
+  assert.equal(resumed.partial, true);
+  collector.observe(started('overflow'));
+  collector.observe(delta('z', 'overflow'));
+  assert.equal(collector.snapshot().find(item => item.itemId === 'overflow').characters, 3);
+  assert.equal(collector.snapshot().find(item => item.itemId === 'overflow').partial, true);
+  const coverage = collector.coverage(); coverage.droppedEvents = 0;
+  assert.equal(collector.coverage().droppedEvents, 2);
+  assert.equal(collector.snapshot().length, 20);
+});
+
 test('turn completion, duplicate starts and cross turn ownership cannot reopen finished items', async () => {
   const { GenerationAccumulator } = await import('./generation-bridge.mjs');
   const collector = new GenerationAccumulator();

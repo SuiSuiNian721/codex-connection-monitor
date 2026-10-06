@@ -1,3 +1,5 @@
+import { buildTaskView } from './performance-view.mjs';
+
 const isMetric = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const numberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
 
@@ -12,6 +14,27 @@ export function formatDuration(value) {
   const minutes = Math.floor(value / 60000);
   const seconds = Math.floor((value % 60000) / 1000);
   return `${numberFormatter.format(minutes)} min ${seconds} s`;
+}
+
+// A delayed status response must not replace a newer fast generation response.
+export function newerGeneration(current, incoming, acceptSameTimestamp = false) {
+  if (!incoming || typeof incoming !== 'object') return current;
+  if (!current || typeof current !== 'object') return incoming;
+  const previous = Date.parse(current.updatedAt);
+  const next = Date.parse(incoming.updatedAt);
+  if (acceptSameTimestamp && !Number.isFinite(next) && ['waiting-launch', 'unavailable'].includes(incoming.status)) return incoming;
+  if (Number.isFinite(previous) && (!Number.isFinite(next) || next < previous || (next === previous && !acceptSameTimestamp))) return current;
+  return incoming;
+}
+
+export function mergeStatusGeneration(current, incoming, revisionAtRequest, currentRevision) {
+  // A newer fast response can revoke its timestamp along with the binding.
+  // Use request ordering here rather than attempting to compare that null date.
+  return revisionAtRequest === currentRevision ? newerGeneration(current, incoming, true) : current;
+}
+
+export function taskDisplayTitle(task) {
+  return typeof task?.sessionTitle === 'string' && task.sessionTitle.trim() ? task.sessionTitle.trim() : '未命名会话';
 }
 
 export function selectTurns(turns, model = '') {
@@ -56,21 +79,23 @@ export function generationState(generation, turns = [], model = '', connected = 
   if (ageMs === null && ['collecting', 'idle'].includes(status)) status = 'unavailable';
   const fresh = connected && ['collecting', 'idle'].includes(status);
   const windowMs = isMetric(generation?.windowMs) && generation.windowMs > 0 ? generation.windowMs : 3000;
-  const streams = (Array.isArray(generation?.streams) ? generation.streams : []).filter(item => item && typeof item === 'object').slice(0, 20).map(item => {
+  const streams = (Array.isArray(generation?.streams) ? generation.streams : []).filter(item => item && typeof item === 'object').slice(0, 40).map(item => {
     const turn = selectTurns(turns).find(turn => typeof item.threadId === 'string' && typeof item.turnId === 'string'
       && item.threadId === turn.sessionId && item.turnId === turn.id);
+    const streamState = ['completed', 'cancelled', 'error', 'failed', 'interrupted'].includes(turn?.status)
+      ? 'completed' : ['generating', 'waiting', 'completed'].includes(item.state) ? item.state : null;
     const deltaAt = Date.parse(item.lastDeltaAt);
     const deltaAgeMs = Number.isFinite(deltaAt) ? Math.max(0, now - deltaAt) : null;
     const observedAt = Object.hasOwn(item, 'observedAt') ? item.observedAt : generation?.updatedAt;
     const observedTimestamp = Date.parse(observedAt);
     const observationAgeMs = Number.isFinite(observedTimestamp) ? Math.max(0, now - observedTimestamp) : null;
     const streamFresh = fresh && observationAgeMs !== null && observationAgeMs <= 5000 && observedTimestamp <= now + 1000;
-    const measurable = streamFresh && ['generating', 'waiting'].includes(item.state) && isMetric(item.charactersPerSecond)
+    const measurable = streamFresh && ['generating', 'waiting'].includes(streamState) && isMetric(item.charactersPerSecond)
       && isMetric(item.characters) && item.characters > 0 && deltaAgeMs !== null && deltaAt <= now + 1000;
     const paused = deltaAgeMs !== null && deltaAgeMs >= windowMs;
     return { threadId: typeof item.threadId === 'string' ? item.threadId : '', turnId: typeof item.turnId === 'string' ? item.turnId : '',
       itemId: typeof item.itemId === 'string' ? item.itemId : '', phase: ['final_answer', 'commentary'].includes(item.phase) ? item.phase : null,
-      state: ['generating', 'waiting', 'completed'].includes(item.state) ? item.state : null,
+      state: streamState, partial: item.partial === true,
       model: typeof turn?.model === 'string' && turn.model ? turn.model : null,
       characters: isMetric(item.characters) ? item.characters : null,
       windowCharacters: measurable ? paused ? 0 : isMetric(item.windowCharacters) ? item.windowCharacters : null : null,
@@ -83,10 +108,17 @@ export function generationState(generation, turns = [], model = '', connected = 
 }
 
 export function generationCaptureNote(generation, state) {
+  if (!state?.fresh) return '';
+  const notes = [];
   const health = generation?.captureHealth;
-  if (!state?.fresh || health?.state !== 'ok' || !Number.isSafeInteger(health.recoveries) || health.recoveries < 0) return '';
-  if (typeof health.reattachedAt === 'string' && Number.isFinite(Date.parse(health.reattachedAt))) return '采集已恢复，累计从恢复后开始，未补算中断时段。';
-  return health.recoveries > 0 ? '本地快照写入曾失败，现已自动恢复。' : '';
+  if (health?.state === 'ok' && Number.isSafeInteger(health.recoveries) && health.recoveries >= 0) {
+    if (typeof health.reattachedAt === 'string' && Number.isFinite(Date.parse(health.reattachedAt))) notes.push('采集已恢复，累计从恢复后开始，未补算中断时段。');
+    else if (health.recoveries > 0) notes.push('本地快照写入曾失败，现已自动恢复。');
+  }
+  const droppedEvents = generation?.coverage?.droppedEvents;
+  if (Number.isSafeInteger(droppedEvents) && droppedEvents > 0) notes.push(`实时采集曾达到活动消息保留上限，已跳过 ${formatNumber(droppedEvents)} 个事件；这些事件未计入速度与累计。`);
+  if (state.streams?.some(stream => stream.partial)) notes.push('部分消息为局部采集，计数仅包含已观测片段，未补算开始前的输出。');
+  return notes.join(' ');
 }
 
 function displayText(value) {
@@ -109,7 +141,7 @@ function node(tag, className = '', content) {
 }
 
 function statusName(status) {
-  return ({ running: '进行中', completed: '已完成', cancelled: '已取消', error: '运行错误', failed: '运行错误', idle: '尚未开始', interrupted: '已中断', incomplete: '记录不完整' })[status] || displayText(status);
+  return ({ running: '轮次未结束', completed: '已完成', cancelled: '已取消', error: '运行错误', failed: '运行错误', idle: '尚未开始', interrupted: '已中断', incomplete: '轮次待确认' })[status] || displayText(status);
 }
 
 const networkStageNames = { local: '本地网络', proxy: '本机代理', vpn: 'VPN / 出口路径', openai: 'OpenAI 路径' };
@@ -220,13 +252,27 @@ function startDashboard() {
   let collectorConnected = false;
   let networkSignature = '';
   let generationSignature = '';
+  let selectedTaskKey = '';
+  let generationSnapshot = null;
+  let generationPromise = null;
+  let generationTimer = null;
+  let generationRevision = 0;
+  let generationEndpointConnected = false;
+  let connectionError = '';
+
+  function renderConnection() {
+    const partial = !collectorConnected && generationEndpointConnected;
+    $('connection-dot').className = `status-dot ${collectorConnected ? 'connected' : 'offline'}`;
+    $('connection-label').textContent = collectorConnected ? '本地采集器已连接 · 关闭此页面不影响采集'
+      : partial ? '本地状态暂不可用 · 实时采集仍连接' : '暂时无法连接本地采集器';
+    $('connection-error').hidden = collectorConnected;
+    $('connection-error').textContent = collectorConnected ? '' : `${snapshot ? '已保留上次成功读取的数据。' : '尚未读取到完整状态。'}${connectionError}${partial ? ' 轮次与网络状态暂不可更新；实时数据仍按自身有效期显示。' : ''} 页面会自动重试；此状态仅反映与本地采集器的连接，不能判断外网、VPN 或 OpenAI 的网络状况。`;
+  }
 
   function setConnection(ok, error = '') {
     collectorConnected = ok;
-    $('connection-dot').className = `status-dot ${ok ? 'connected' : 'offline'}`;
-    $('connection-label').textContent = ok ? '本地采集器已连接 · 关闭此页面不影响采集' : '暂时无法连接本地采集器';
-    $('connection-error').hidden = ok;
-    $('connection-error').textContent = ok ? '' : `${snapshot ? '已保留上次成功读取的数据。' : '尚未读取到后台数据。'}${error} 页面会自动重试；此状态仅反映与本地采集器的连接，不能判断外网、VPN 或 OpenAI 的网络状况。`;
+    connectionError = error;
+    renderConnection();
     renderNetwork();
     renderGeneration();
     updateControls();
@@ -261,17 +307,6 @@ function startDashboard() {
     if (!force && signature === telemetrySignature) return;
     telemetrySignature = signature;
     const turns = selectTurns(telemetry.turns, filter);
-    const latest = turns[0];
-    $('metric-ttft').textContent = formatDuration(latest?.ttftMs);
-    $('metric-output').textContent = formatNumber(latest?.outputTokens);
-    $('metric-reasoning').textContent = formatNumber(latest?.reasoningTokens);
-    $('metric-throughput').textContent = formatNumber(latest?.throughputTps);
-    const message = messageOutputState(latest?.messageOutput);
-    $('metric-message-speed').textContent = formatNumber(message.rate);
-    $('message-speed-description').textContent = message.reason || `${latest.messageOutput.phase === 'final_answer' ? '最终回答' : '中间回复'} · ${formatNumber(latest.messageOutput.characters)} 字符 / ${formatDuration(latest.messageOutput.durationMs)} · 完成于 ${formatDate(latest.messageOutput.completedAt)}`;
-    $('latest-turn-label').textContent = latest
-      ? `${formatDate(latest.startedAt)} · ${displayText(latest.model)} · ${displayText(latest.effort)} · ${statusName(latest.status)}${latest.warnings?.length ? ' · 此轮存在采集提示，见下表' : ''}`
-      : filter ? '这个模型暂无轮次记录；指标显示为“—”。' : '等待本地会话记录；没有记录时，指标显示为“—”。';
     $('record-count').textContent = `${turns.length} 条${turns.length > 50 ? ' · 展示最近 50 条' : ''}`;
     const rows = document.createDocumentFragment();
     turns.slice(0, 50).forEach(turn => {
@@ -284,7 +319,7 @@ function startDashboard() {
       if (Array.isArray(turn.warnings) && turn.warnings.length) {
         const details = node('details', 'cell-secondary cell-warning');
         details.dataset.persist = `turn-${turn.id}`;
-        details.append(node('summary', '', `${turn.warnings.length} 条采集提示`));
+        details.append(node('summary', '', `${turn.warnings.length} 条记录说明`));
         turn.warnings.forEach(warning => details.append(node('p', '', displayText(warning))));
         model.append(details);
       }
@@ -318,33 +353,98 @@ function startDashboard() {
     $('source-warnings').replaceChildren(sourceContent);
   }
 
+  function setMetric(id, value, fallback, formatter = formatNumber) {
+    $(id).textContent = isMetric(value) ? formatter(value) : fallback;
+    $(id).classList.toggle('metric-state', !isMetric(value));
+  }
+
+  function renderSelectedTask(view) {
+    const task = view.selected;
+    const turn = task?.turn;
+    const missing = selectedTaskKey ? '请选择任务' : '等待记录';
+    const running = task?.status === 'running';
+    const pending = running ? '待本轮完成' : '未提供';
+    setMetric('metric-ttft', turn?.ttftMs, task ? pending : missing, formatDuration);
+    setMetric('metric-output', turn?.outputTokens, task ? '未提供' : missing);
+    setMetric('metric-reasoning', turn?.reasoningTokens, task ? '未提供' : missing);
+    setMetric('metric-throughput', turn?.throughputTps, task ? pending : missing);
+    $('ttft-description').textContent = running && !isMetric(turn?.ttftMs) ? '此来源在本轮完成后提供首 token 等待时间' : '来源记录的首 token 等待时间';
+    $('throughput-description').textContent = running && !isMetric(turn?.throughputTps) ? '等待本轮结束与完整用量，才能计算 token / 秒' : 'token / 秒 · 所选任务整轮口径';
+    const message = messageOutputState(turn?.messageOutput);
+    setMetric('metric-message-speed', message.rate, task ? running ? '等待消息完成' : '无法计算' : missing);
+    $('message-speed-description').textContent = !task ? '先在上方选择一个任务。' : message.reason || `${turn.messageOutput.phase === 'final_answer' ? '最终回答' : '中间回复'} · ${formatNumber(turn.messageOutput.characters)} 字符 / ${formatDuration(turn.messageOutput.durationMs)} · 完成于 ${formatDate(turn.messageOutput.completedAt)}`;
+    const shortId = value => value ? `${value.slice(0, 8)}…${value.slice(-4)}` : '未知';
+    $('latest-turn-label').textContent = task
+      ? `当前选中：${taskDisplayTitle(task)} · ${task.model || '未知模型'}${turn?.effort ? ` · ${turn.effort}` : ''} · ${statusName(task.status)} · 会话 ${shortId(task.sessionId)} / 轮次 ${shortId(task.turnId)} · ${formatDate(task.startedAt)}`
+      : selectedTaskKey ? '所选任务已不在当前采集记录中。请在上方重新选择；不会自动切到其他任务。' : $('task-search').value.trim() ? '没有匹配的任务。可调整关键词或模型筛选。' : '等待本地会话或实时文字记录。';
+    const focused = document.activeElement?.closest('#task-list [data-task-key]')?.dataset.taskKey;
+    const existing = new Map([...$('task-list').querySelectorAll('[data-task-key]')].map(button => [button.dataset.taskKey, button]));
+    const buttons = [];
+    const receptionNames = { receiving: '接收中', paused: '本窗口无新文字', waiting: '等待文字', completed: '已完成', stale: '数据过期', unavailable: '采集未就绪' };
+    view.tasks.forEach(item => {
+      const button = existing.get(item.key) || node('button', 'task-option');
+      button.type = 'button';
+      button.dataset.taskKey = item.key;
+      button.dataset.reception = item.receptionState;
+      button.setAttribute('aria-pressed', String(item.key === view.selectedKey));
+      if (!button.firstChild) {
+        const identity = node('span');
+        identity.append(node('span', 'task-option-title'), node('span', 'task-option-heading'), node('span', 'task-option-meta'));
+        button.append(identity, node('span', 'task-option-rate'));
+      }
+      const content = {
+        'task-option-title': taskDisplayTitle(item),
+        'task-option-heading': `${item.model || '未知模型'} · ${statusName(item.status)} · ${receptionNames[item.receptionState] || '等待文字'}`,
+        'task-option-meta': `${formatDate(item.startedAt)} · 会话 ${shortId(item.sessionId)} / 轮次 ${shortId(item.turnId)}`,
+        'task-option-rate': isMetric(item.rate) ? `${formatNumber(item.rate)} 字符/s` : receptionNames[item.receptionState] || '等待文字',
+      };
+      for (const [className, text] of Object.entries(content)) {
+        const element = button.querySelector(`.${className}`);
+        if (element.textContent !== text) element.textContent = text;
+      }
+      button.title = `${taskDisplayTitle(item)} · 会话 ${item.sessionId} · 轮次 ${item.turnId}`;
+      buttons.push(button);
+    });
+    if (!buttons.length) $('task-list').replaceChildren(node('p', 'task-empty', $('task-search').value.trim() ? '没有匹配的任务，请尝试其他关键词或清空搜索。' : $('model-filter').value ? '此模型暂无任务记录。' : '等待本地会话或实时文字记录。'));
+    else if (buttons.length !== $('task-list').children.length || buttons.some((button, index) => $('task-list').children[index] !== button)) $('task-list').replaceChildren(...buttons);
+    if (focused) [...$('task-list').querySelectorAll('[data-task-key]')].find(item => item.dataset.taskKey === focused)?.focus({ preventScroll: true });
+    const matches = Number.isSafeInteger(view.matchCount) ? view.matchCount : view.tasks.length;
+    $('task-count').textContent = `匹配 ${matches} 条 · 展示 ${view.tasks.length} 条`;
+    $('task-search-clear').disabled = !$('task-search').value;
+  }
+
   function renderGeneration() {
-    const generation = snapshot?.generation;
+    const generation = generationSnapshot;
+    const generationConnected = collectorConnected || generationEndpointConnected;
     const filter = $('model-filter').value;
-    const state = generationState(generation, snapshot?.telemetry?.turns, filter, collectorConnected);
-    const signature = JSON.stringify([generation, collectorConnected, filter, state.status, Math.floor((state.ageMs || 0) / 1000), state.streams]);
+    const query = $('task-search').value.trim();
+    const sortOrder = $('task-sort').value === 'asc' ? 'asc' : 'desc';
+    const state = generationState(generation, snapshot?.telemetry?.turns, filter, generationConnected);
+    const view = buildTaskView(snapshot?.telemetry, generation, { model: filter, query, sortOrder, selectedKey: selectedTaskKey, connected: generationConnected });
+    selectedTaskKey = view.selectedKey;
+    const signature = JSON.stringify([generation, generationConnected, filter, query, sortOrder, selectedTaskKey, view.matchCount, view.tasks, view.selected, state.status, Math.floor((state.ageMs || 0) / 1000), state.streams]);
     if (signature === generationSignature) return;
     generationSignature = signature;
-    const completed = state.fresh && !state.primary && state.streams.length > 0 && state.streams.every(stream => stream.fresh && stream.state === 'completed');
-    const labels = { 'waiting-launch': '等待正常启动', collecting: '正在接收文字', idle: '等待文字输出', stale: '实时数据已过期', unavailable: '实时采集不可用' };
-    $('generation-status').textContent = completed ? '本条已完成'
-      : state.status === 'collecting' && !state.primary ? '实时采集已连接'
-      : state.fresh && state.primary?.rate === null ? '等待文字输出'
-      : state.primary?.rate === 0 ? '本窗口无新文字' : labels[state.status];
-    $('metric-live-speed').textContent = formatNumber(state.primary?.rate);
-    $('metric-live-speed').closest('.live-speed-card').dataset.state = state.status;
+    renderSelectedTask(view);
+    const task = view.selected;
+    const reception = task?.receptionState;
+    const labels = { receiving: '正在接收文字', paused: '本窗口无新文字', waiting: '等待文字输出', completed: '本轮已完成', stale: '实时数据已过期', unavailable: '实时采集不可用' };
+    const waitingLaunch = state.status === 'waiting-launch' && reception !== 'completed';
+    $('generation-status').textContent = waitingLaunch ? '等待正常启动' : task ? labels[reception] || '等待文字输出' : selectedTaskKey ? '重新选择任务' : '等待任务';
+    const emptyLabels = { completed: '已完成', stale: '数据过期', unavailable: '采集未就绪', waiting: '等待文字' };
+    setMetric('metric-live-speed', task?.rate, waitingLaunch ? '等待启用' : task ? emptyLabels[reception] || '等待文字' : selectedTaskKey ? '请选择任务' : '等待任务');
+    $('metric-live-speed').closest('.live-speed-card').dataset.state = reception === 'stale' || reception === 'unavailable' ? reception : state.status;
     let description;
-    if (state.status === 'waiting-launch') description = '实时采集将在下次正常启动 Codex 后生效；当前会话继续正常使用即可。';
-    else if (state.status === 'stale') description = !collectorConnected ? '本地采集器未连接，当前速度未知；已停止显示上次实时速度。'
+    if (!task) description = selectedTaskKey ? '所选任务已离开当前记录，请重新选择任务。' : '等待任务记录后选择要查看的会话与轮次。';
+    else if (waitingLaunch) description = '实时采集将在下次正常启动 Codex 后生效；当前会话继续正常使用即可。';
+    else if (reception === 'stale') description = !generationConnected ? '本地采集器未连接，当前速度未知；已停止显示上次实时速度。'
       : ['stale', 'unavailable'].includes(generation?.status) && networkText(generation?.reason) ? generation.reason
-      : '实时记录超过 5 秒未更新，当前速度未知。下方保留旧记录供参考。';
-    else if (state.status === 'unavailable') description = networkText(generation?.reason) || '暂时没有可用的实时采集数据，历史消息均速仍可查看。';
-    else if (completed) description = '本条文字消息已完成。等待下一条文字输出，不将最后一个窗口的速度继续显示。';
-    else if (state.primary) {
-      const stream = state.primary;
-      const identity = stream.model || '未知模型（尚未与本地轮次记录匹配）';
-      description = `${identity} · ${stream.phase === 'final_answer' ? '最终回答' : '中间回复'} · ${stream.rate === 0 ? '最近 3 秒没有收到新文字；这不代表断网。' : stream.rate === null ? '等待可统计的文字片段。' : `窗口收到 ${formatNumber(stream.windowCharacters)} 字符；本条累计 ${formatNumber(stream.characters)} 字符。`}`;
-    } else description = filter ? '当前模型暂无已绑定的实时输出；下方独立列出其他模型与未知模型的记录。' : '等待文字输出。思考或工具执行期间可能没有文字片段。';
+      : '所选任务的实时记录超过 5 秒未更新，当前速度未知。其他任务的心跳不会延长此记录的有效期。';
+    else if (reception === 'unavailable') description = ['unavailable', 'stale'].includes(generation?.status) && networkText(generation?.reason) ? generation.reason : '所选任务暂时没有有效的接收速度数据，历史消息均速仍可查看。';
+    else if (reception === 'completed') description = '所选任务已完成，不继续显示最后一个窗口的速度。可在上方选择其他进行中的任务。';
+    else if (reception === 'paused') description = '所选任务最近 3 秒没有收到新文字；这不代表断网。';
+    else if (reception === 'receiving') description = `${task.model || '未知模型（尚未与本地轮次记录匹配）'} · 最近 3 秒收到 ${formatNumber(task.windowCharacters)} 字符 ÷ 3 = ${formatNumber(task.rate)} 字符/秒。`;
+    else description = '所选任务等待下一条文字输出。思考、工具执行或上一条消息刚完成时，可能没有文字片段。';
     $('live-speed-description').textContent = description;
     const captureNote = generationCaptureNote(generation, state);
     $('generation-capture-note').textContent = captureNote;
@@ -364,7 +464,7 @@ function startDashboard() {
       rate.dataset.rate = stream.rate === null ? '' : String(stream.rate);
       heading.append(rate);
       item.append(heading);
-      item.append(node('p', 'generation-stream-meta', `会话 ${shortId(stream.threadId)} · 轮次 ${shortId(stream.turnId)} · 累计 ${formatNumber(stream.characters)} 字符 · 最近片段 ${formatDate(stream.lastDeltaAt)}`));
+      item.append(node('p', 'generation-stream-meta', `会话 ${shortId(stream.threadId)} · 轮次 ${shortId(stream.turnId)} · ${stream.partial ? '已观测' : '累计'} ${formatNumber(stream.characters)} 字符${stream.partial ? ' · 局部采集' : ''} · 最近片段 ${formatDate(stream.lastDeltaAt)}`));
       streams.append(item);
     });
     if (!state.streams.length) streams.append(node('li', '', state.status === 'waiting-launch' ? '下次正常启动后，文字流记录会显示在这里。' : '暂无实时文字流记录。'));
@@ -496,11 +596,13 @@ function startDashboard() {
     clearTimeout(timer);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 12000);
+    const revisionAtRequest = generationRevision;
     refreshPromise = (async () => {
       try {
         const data = await readResponse(await fetch('/api/status', { cache: 'no-store', signal: controller.signal }));
         if (!data || typeof data !== 'object' || !data.telemetry) throw new Error('后台状态数据不完整。');
-        snapshot = data;
+        generationSnapshot = mergeStatusGeneration(generationSnapshot, data.generation, revisionAtRequest, generationRevision);
+        snapshot = { ...data, generation: generationSnapshot };
         setConnection(true);
         render();
       } catch (error) {
@@ -516,8 +618,57 @@ function startDashboard() {
     return refreshPromise;
   }
 
+  function refreshGeneration() {
+    if (generationPromise) return generationPromise;
+    clearTimeout(generationTimer);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000);
+    let interval = 250;
+    generationPromise = (async () => {
+      try {
+        const response = await fetch('/api/generation', { cache: 'no-store', signal: controller.signal });
+        if (response.status === 404) interval = 5000;
+        const data = await readResponse(response);
+        if (!data?.generation || !['waiting-launch', 'collecting', 'idle', 'stale', 'unavailable'].includes(data.generation.status)) throw new Error('缺少接收数据。');
+        generationSnapshot = newerGeneration(generationSnapshot, data.generation, true);
+        generationRevision += 1;
+        generationEndpointConnected = true;
+        if (snapshot) snapshot.generation = generationSnapshot;
+        renderConnection();
+        renderGeneration();
+      } catch {
+        // The 1-second status endpoint remains a fallback. A fast-read failure
+        // must not change the independent status/network connection indicator.
+        interval = Math.max(interval, 1000);
+        generationEndpointConnected = false;
+        renderConnection();
+        renderGeneration();
+      } finally {
+        clearTimeout(timeout);
+        generationPromise = null;
+        generationTimer = setTimeout(refreshGeneration, interval);
+      }
+    })();
+    return generationPromise;
+  }
+
   $('refresh-button').addEventListener('click', refreshStatus);
-  $('model-filter').addEventListener('change', () => { if (snapshot) { renderTelemetry(true); renderGeneration(); } });
+  $('model-filter').addEventListener('change', () => { selectedTaskKey = ''; if (snapshot) { renderTelemetry(true); renderGeneration(); } });
+  $('task-search').addEventListener('input', () => { $('task-search-clear').disabled = !$('task-search').value; selectedTaskKey = ''; renderGeneration(); });
+  $('task-sort').addEventListener('change', renderGeneration);
+  $('task-search-clear').addEventListener('click', () => {
+    $('task-search').value = '';
+    $('task-search-clear').disabled = true;
+    selectedTaskKey = '';
+    renderGeneration();
+    $('task-search').focus();
+  });
+  $('task-list').addEventListener('click', event => {
+    const button = event.target.closest('[data-task-key]');
+    if (!button || !$('task-list').contains(button)) return;
+    selectedTaskKey = button.dataset.taskKey;
+    renderGeneration();
+  });
   let trendWidth = null;
   const trendObserver = new ResizeObserver(([entry]) => {
     if (entry.contentRect.width === trendWidth) return;
@@ -529,6 +680,7 @@ function startDashboard() {
   renderGeneration();
   setInterval(() => { renderNetwork(); renderGeneration(); }, 1000);
   refreshStatus();
+  refreshGeneration();
 }
 
 if (typeof document !== 'undefined') startDashboard();

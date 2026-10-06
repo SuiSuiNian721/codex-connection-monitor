@@ -65,6 +65,7 @@ function isAppServerInvocation(args, realCli) {
 export class GenerationAccumulator {
   #items = new Map();
   #closedTurns = new Map();
+  #droppedEvents = 0;
   #monotonicNow;
   #wallNow;
 
@@ -77,19 +78,27 @@ export class GenerationAccumulator {
 
   #key(threadId, turnId, itemId) { return `${threadId}\0${turnId}\0${itemId}`; }
 
-  #get(threadId, turnId, itemId, phase = null) {
+  #get(threadId, turnId, itemId, phase = null, started = false) {
     if (!safeId(threadId) || !safeId(turnId) || !safeId(itemId)) return null;
     if (this.#closedTurns.has(this.#key(threadId, turnId, 'closed'))) return null;
     const key = this.#key(threadId, turnId, itemId);
     let item = this.#items.get(key);
     if (!item) {
+      if (this.#items.size >= itemLimit) {
+        // Finished background messages must not reset a still streaming item's count.
+        const completed = [...this.#items].find(([, candidate]) => candidate.state === 'completed');
+        if (!completed) {
+          this.#droppedEvents = Math.min(Number.MAX_SAFE_INTEGER, this.#droppedEvents + 1);
+          return null;
+        }
+        this.#items.delete(completed[0]);
+      }
       item = {
-        threadId, turnId, itemId, phase: phaseOf(phase), state: 'waiting', characters: 0,
+        threadId, turnId, itemId, phase: phaseOf(phase), state: 'waiting', characters: 0, partial: !started,
         startedAt: this.#iso(), lastDeltaAt: null, completedAt: null, lastDeltaTick: null,
         pendingHighSurrogate: false, buckets: new Float64Array(bucketCount), ticks: new Float64Array(bucketCount).fill(-Infinity),
       };
       this.#items.set(key, item);
-      while (this.#items.size > itemLimit) this.#items.delete(this.#items.keys().next().value);
     } else if (phaseOf(phase)) {
       item.phase = phaseOf(phase);
     }
@@ -130,7 +139,7 @@ export class GenerationAccumulator {
     }
     if (method === 'item/started' || method === 'item/completed') {
       if (params.item?.type !== 'agentMessage') return;
-      const item = this.#get(threadId, params.turnId, params.item.id, params.item.phase);
+      const item = this.#get(threadId, params.turnId, params.item.id, params.item.phase, method === 'item/started');
       if (item && method === 'item/completed') this.#complete(item);
       return;
     }
@@ -161,6 +170,8 @@ export class GenerationAccumulator {
     item.state = 'generating';
   }
 
+  coverage() { return { droppedEvents: this.#droppedEvents }; }
+
   snapshot() {
     const now = this.#monotonicNow();
     const cutoff = Math.floor(now) - windowMs;
@@ -173,7 +184,7 @@ export class GenerationAccumulator {
       }
       const state = item.state === 'completed' ? 'completed' : item.lastDeltaTick !== null && now - item.lastDeltaTick < 1000 ? 'generating' : 'waiting';
       return {
-        threadId: item.threadId, turnId: item.turnId, itemId: item.itemId, phase: item.phase, state,
+        threadId: item.threadId, turnId: item.turnId, itemId: item.itemId, phase: item.phase, state, partial: item.partial,
         characters: item.characters, windowCharacters,
         charactersPerSecond: state === 'completed' ? null : windowCharacters / (windowMs / 1000),
         startedAt: item.startedAt, lastDeltaAt: item.lastDeltaAt, completedAt: item.completedAt,
@@ -319,7 +330,7 @@ class SnapshotWriter {
           captureHealth.recoveries++;
           captureHealth.lastRecoveredAt = new Date().toISOString();
         }
-        const snapshot = { ...this.#identity, updatedAt: new Date().toISOString(), windowMs, state, items: this.#collector.snapshot(), captureHealth };
+        const snapshot = { ...this.#identity, updatedAt: new Date().toISOString(), windowMs, state, items: this.#collector.snapshot(), coverage: this.#collector.coverage(), captureHealth };
         stage = 'write';
         await writeFile(temporary, JSON.stringify(snapshot), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
         stage = 'path-check';

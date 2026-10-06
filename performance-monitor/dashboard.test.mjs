@@ -2,8 +2,41 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
-const source = await readFile(new URL('./public/app.js', import.meta.url), 'utf8');
-const { formatNumber, formatDuration, selectTurns, trendSamples, networkStageState, messageOutputState, generationState, generationCaptureNote } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+const source = (await readFile(new URL('./public/app.js', import.meta.url), 'utf8'))
+  .replace("'./performance-view.mjs'", JSON.stringify(new URL('./public/performance-view.mjs', import.meta.url).href));
+const { formatNumber, formatDuration, selectTurns, trendSamples, networkStageState, messageOutputState, generationState, generationCaptureNote, newerGeneration, mergeStatusGeneration, taskDisplayTitle } = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+
+test('任务展示实际会话标题，缺失时不拿模型或正文充当标题', () => {
+  assert.equal(taskDisplayTitle({ sessionTitle: '  监测器：任务排序  ' }), '监测器：任务排序');
+  assert.equal(taskDisplayTitle({ sessionTitle: '<img src=x onerror=alert(1)>' }), '<img src=x onerror=alert(1)>');
+  for (const sessionTitle of [null, undefined, '', '   ', 42, {}]) {
+    assert.equal(taskDisplayTitle({ sessionTitle, model: 'model-test', text: '私人正文' }), '未命名会话');
+  }
+});
+
+test('快接口撤销绑定后，迟到的状态响应不能复活带旧时间戳的速度', () => {
+  const oldStatus = { updatedAt: '2026-10-06T00:00:10Z', status: 'collecting', streams: [{ charactersPerSecond: 20 }] };
+  for (const status of ['unavailable', 'waiting-launch']) {
+    const revoked = { updatedAt: null, status, streams: [] };
+    assert.equal(mergeStatusGeneration(revoked, oldStatus, 4, 5), revoked);
+    assert.equal(mergeStatusGeneration(revoked, oldStatus, 5, 5), oldStatus, '本次请求没有新的快接口响应时，状态接口仍可提供回退数据');
+  }
+});
+
+test('慢状态响应不覆盖快速接口的新数据，同时间保留已接收快照', () => {
+  const current = { updatedAt: '2026-10-06T00:00:10Z', streams: ['new'] };
+  assert.equal(newerGeneration(current, { updatedAt: '2026-10-06T00:00:09Z', streams: ['old'] }), current);
+  assert.equal(newerGeneration(current, { updatedAt: current.updatedAt, streams: ['old'] }), current);
+  const stopped = { updatedAt: current.updatedAt, status: 'stale' };
+  assert.equal(newerGeneration(current, stopped, true), stopped, '快接口可更新同一快照的不可用状态');
+  assert.equal(newerGeneration(current, { updatedAt: null }), current);
+  const unbound = { updatedAt: null, status: 'unavailable', streams: [] };
+  assert.equal(newerGeneration(current, unbound), current);
+  assert.equal(newerGeneration(current, unbound, true), unbound, '可信的新请求可立即撤销已失效的采集绑定');
+  const next = { updatedAt: '2026-10-06T00:00:11Z', streams: [] };
+  assert.equal(newerGeneration(current, next), next);
+  assert.equal(newerGeneration(null, next), next);
+});
 
 test('未知指标不会被显示为零，真实零仍可识别', () => {
   for (const value of [null, undefined, NaN, Infinity, -1, '0']) {
@@ -92,6 +125,21 @@ test('实时输出停顿归零，完成、过期与采集器断线清除实时�
   assert.equal(generationState({ ...generation, status: 'waiting-launch' }, [], '', true, now).primary, null);
 });
 
+test('实时会话详情也以已确认的轮次终态为准，不显示迟到活动流的旧速度', () => {
+  const now = Date.parse('2026-10-06T00:00:10Z');
+  const stream = { threadId: 's', turnId: 't', itemId: 'm', state: 'generating', characters: 100, windowCharacters: 60, charactersPerSecond: 20,
+    startedAt: '2026-10-06T00:00:00Z', lastDeltaAt: '2026-10-06T00:00:10Z' };
+  const generation = { updatedAt: '2026-10-06T00:00:10Z', status: 'collecting', windowMs: 3000, streams: [stream] };
+  for (const status of ['completed', 'cancelled', 'error', 'failed', 'interrupted']) {
+    const state = generationState(generation, [{ sessionId: 's', id: 't', model: 'alpha', status }], '', true, now);
+    assert.equal(state.primary, null, status);
+    assert.equal(state.streams[0].rate, null, status);
+    assert.equal(state.streams[0].state, 'completed', status);
+  }
+  assert.equal(generationState(generation, [{ sessionId: 'other', id: 't', status: 'completed' }], '', true, now).primary.rate, 20,
+    '另一会话的同名轮次不能覆盖当前流');
+});
+
 test('实时显示状态只提取计数与标识，不保留正文或未知字段', () => {
   const now = Date.parse('2026-10-06T00:00:10Z');
   const generation = { updatedAt: '2026-10-06T00:00:10Z', status: 'collecting', windowMs: 3000,
@@ -119,4 +167,40 @@ test('热接恢复说明累计边界，普通写入重试恢复不误报丢字',
   assert.equal(generationCaptureNote(generation, { fresh: false }), '');
   assert.equal(generationCaptureNote({ captureHealth: { state: 'PRIVATE_BODY', recoveries: 2, reattachedAt: '2026-10-06T00:00:10Z' } }, { fresh: true }), '');
   assert.equal(generationCaptureNote({ captureHealth: { state: 'ok', recoveries: -1, reattachedAt: null } }, { fresh: true }), '');
+});
+
+test('局部采集和保留上限独立说明，只接受明确标记与安全整数事件计数', () => {
+  const now = Date.parse('2026-10-06T00:00:10Z');
+  const stream = { threadId: 's', turnId: 't', itemId: 'm', state: 'generating', partial: true, characters: 100, windowCharacters: 60,
+    charactersPerSecond: 20, startedAt: '2026-10-06T00:00:08Z', lastDeltaAt: '2026-10-06T00:00:10Z' };
+  const generation = { updatedAt: '2026-10-06T00:00:10Z', status: 'collecting', windowMs: 3000, streams: [stream],
+    coverage: { droppedEvents: 7, privateText: 'PRIVATE_COVERAGE' }, reason: 'PRIVATE_REASON' };
+  const state = generationState(generation, [], '', true, now);
+  assert.equal(state.streams[0].partial, true);
+  assert.equal(state.streams[0].rate, 20, '局部采集不改变已观测窗口的速度');
+  const note = generationCaptureNote(generation, state);
+  assert.match(note, /保留上限.*7.*事件/);
+  assert.match(note, /局部采集.*已观测片段/);
+  assert.doesNotMatch(note, /PRIVATE/);
+  assert.equal(generationCaptureNote(generation, { ...state, fresh: false }), '');
+  for (const partial of [false, null, undefined, 1, 'true']) {
+    assert.equal(generationState({ ...generation, streams: [{ ...stream, partial }] }, [], '', true, now).streams[0].partial, false);
+  }
+  for (const droppedEvents of [0, -1, 1.5, '7', NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(generationCaptureNote({ coverage: { droppedEvents } }, { fresh: true, streams: [] }), '');
+  }
+  assert.match(generationCaptureNote({ coverage: { droppedEvents: Number.MAX_SAFE_INTEGER } }, { fresh: true, streams: [] }), /事件/);
+});
+
+test('实时详情保留后端返回的40条流，后半段局部采集信息不再被隐藏', () => {
+  const now = Date.parse('2026-10-06T00:00:10Z');
+  const timestamp = new Date(now).toISOString();
+  const streams = Array.from({ length: 41 }, (_, i) => ({ threadId: `s${i}`, turnId: `t${i}`, itemId: `m${i}`, state: 'generating',
+    partial: i === 39, characters: 60, windowCharacters: 60, charactersPerSecond: 20, startedAt: timestamp, lastDeltaAt: timestamp, observedAt: timestamp }));
+  const generation = { updatedAt: timestamp, status: 'collecting', windowMs: 3000, streams };
+  const state = generationState(generation, [], '', true, now);
+  assert.equal(state.streams.length, 40);
+  assert.equal(state.streams.find(item => item.itemId === 'm39').rate, 20);
+  assert.match(generationCaptureNote(generation, state), /局部采集/);
+  assert.equal(state.streams.some(item => item.itemId === 'm40'), false, '仍保持与后端相同的有界白名单');
 });
