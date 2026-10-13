@@ -12,6 +12,7 @@ $scriptRoot = Split-Path -Parent $launcherPath
 $logPath = Join-Path $scriptRoot 'launcher.log'
 Import-Module (Join-Path $scriptRoot 'CodexProxyLauncher.psm1') -Force
 Import-Module (Join-Path $scriptRoot 'CuaRuntime.psm1') -Force
+Import-Module (Join-Path $scriptRoot 'CodexStartup.psm1') -Force
 $launchMutex = $null
 $ownsLaunchMutex = $false
 
@@ -39,6 +40,124 @@ function Get-RunningCodexProcesses {
         }
         catch { $false }
     })
+}
+
+function Request-CodexWindowActivation {
+    param([object[]]$Processes)
+    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_ELECTRON_USER_DATA_PATH)) {
+        throw '检测到独立的 Codex 配置目录，请从该会话原来的入口唤起窗口；未另开应用。'
+    }
+    # 单实例锁按桌面配置隔离；同名程序和安装路径相同都不足以确认是同一会话。
+    $roots = @()
+    foreach ($process in @($Processes)) {
+        try {
+            $processId = [int]$process.Id
+            $executable = [IO.Path]::GetFullPath([string]$process.Path)
+            if ($processId -le 0 -or $executable -notmatch '\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\(?:ChatGPT|Codex)\.exe$') { throw 'Unverified executable.' }
+            $records = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop)
+            if ($records.Count -ne 1) { throw 'Process identity unavailable.' }
+            $record = $records[0]
+            if ([int]$record.ProcessId -ne $processId -or -not $record.ExecutablePath -or
+                [IO.Path]::GetFullPath([string]$record.ExecutablePath) -ine $executable -or
+                $null -eq $process.StartTime -or $null -eq $record.CreationDate -or
+                [math]::Abs((([datetime]$record.CreationDate).ToUniversalTime() - ([datetime]$process.StartTime).ToUniversalTime()).TotalMilliseconds) -gt 1 -or
+                [string]::IsNullOrWhiteSpace([string]$record.CommandLine)) { throw 'Process identity changed or unreadable.' }
+        }
+        catch {
+            throw '无法核对后台 Codex 的进程身份，请从该会话原来的入口唤起窗口；未另开应用。'
+        }
+        $commandLine = [string]$record.CommandLine
+        if ($commandLine -match '(?:^|\s|")--type(?:=|\s|"|$)') { continue }
+        if ($commandLine -match '(?:^|\s|")--user-data-dir(?:=|\s|"|$)') {
+            throw '检测到 Codex 使用独立配置，请从该会话原来的入口唤起窗口；未另开应用。'
+        }
+        $roots += $executable
+    }
+    if ($roots.Count -ne 1) {
+        throw '无法确认唯一的后台 Codex 主进程，请从该会话原来的入口唤起窗口；未另开应用。'
+    }
+    $executable = $roots[0]
+    Write-Host '检测到 Codex 留在后台，正在请求显示已有窗口……'
+    # 商店版将无参数的第二次打开交给已有实例处理，第二个进程会自行退出。
+    Start-Process -FilePath $executable -WorkingDirectory (Split-Path $executable -Parent) | Out-Null
+    Write-LauncherLog 'Requested native activation of the existing Codex window.'
+}
+
+function Confirm-CodexWindowReady {
+    param([object]$Result)
+    if ($Result.Status -eq 'Ready') { return $Result.Process }
+    Write-LauncherLog "Codex window not ready. Status=$($Result.Status) PID(s)=$($Result.ProcessIds -join ',') Seconds=$($Result.ElapsedSeconds)" 'WARN'
+    if ($Result.Status -eq 'TimedOut') {
+        throw "已等待 $($Result.ElapsedSeconds) 秒，Codex 仍有后台进程，但没有可用窗口（PID：$($Result.ProcessIds -join ',')）。本次启动未完成，后台进程已保留；详细记录见 launcher.log。"
+    }
+    throw '等待窗口时 Codex 进程已经退出，本次启动未完成；详细记录见 launcher.log。'
+}
+
+function Get-CodexStartupBackgroundRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$CodexExecutable,
+        [Parameter(Mandatory = $true)][datetime]$LaunchStartedAt,
+        [Parameter(Mandatory = $true)][string]$ProxyUri
+    )
+    $expectedPath = [IO.Path]::GetFullPath($CodexExecutable)
+    $earliestStart = $LaunchStartedAt.ToUniversalTime().AddMilliseconds(-1)
+    $proxyArgument = [regex]::Escape('--proxy-server=' + $ProxyUri)
+    $proxyPattern = '(?:^|\s)(?:' + $proxyArgument + '|"' + $proxyArgument + '")(?=\s|$)'
+    $candidates = @(foreach ($candidate in @(Get-RunningCodexProcesses -ExecutablePath $CodexExecutable)) {
+        try {
+            if ($candidate.PSObject.Methods['Refresh']) { $candidate.Refresh() }
+            if ($candidate.HasExited -or -not $candidate.Path -or
+                [IO.Path]::GetFullPath($candidate.Path) -ine $expectedPath) { continue }
+            $startedAt = $candidate.StartTime.ToUniversalTime()
+            if ($startedAt -lt $earliestStart) { continue }
+            $records = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($candidate.Id)" -ErrorAction Stop)
+            if ($records.Count -ne 1) { continue }
+            $record = $records[0]
+            if ($record.ProcessId -ne $candidate.Id -or -not $record.ExecutablePath -or
+                [IO.Path]::GetFullPath($record.ExecutablePath) -ine $expectedPath -or -not $record.CreationDate) { continue }
+            # CIM 的创建时间精度可能低于 Process；仅容许不足 1 ms 的表示差。
+            if ([math]::Abs(($record.CreationDate.ToUniversalTime() - $startedAt).TotalMilliseconds) -ge 1) { continue }
+            if ([string]::IsNullOrWhiteSpace($record.CommandLine) -or
+                $record.CommandLine -match '(?:^|\s)["'']?--(?:type|user-data-dir)(?:=|\s|["'']|$)') { continue }
+            # 只接受本次固定代理入口，防止等待期间从其他入口新开的实例被绑定。
+            if ($record.CommandLine -notmatch $proxyPattern -or
+                [regex]::Matches($record.CommandLine, '(?:^|\s)"?--proxy-server(?:=|\s|"|$)').Count -ne 1) { continue }
+            $candidate
+        }
+        catch { } # 身份无法核对或正好退出时，保留进程但不建立监测绑定。
+    })
+    if ($candidates.Count -eq 1) { return $candidates[0] }
+    return $null
+}
+
+function Complete-CodexStartup {
+    param(
+        [Parameter(Mandatory = $true)][object]$StartupWindow,
+        [Parameter(Mandatory = $true)][string]$CodexExecutable,
+        [Parameter(Mandatory = $true)][datetime]$LaunchStartedAt,
+        [Parameter(Mandatory = $true)][string]$ProxyUri,
+        [ValidateSet('System', 'Explicit')][string]$ProxyMode = 'System',
+        [switch]$NoWatchdog
+    )
+    $rootProcess = $null
+    if ($StartupWindow.Status -eq 'Ready') {
+        $rootProcess = $StartupWindow.Process
+        Write-LauncherLog "Codex window ready with proxy. RootPID=$($rootProcess.Id)"
+    }
+    elseif ($StartupWindow.Status -eq 'TimedOut') {
+        $rootProcess = Get-CodexStartupBackgroundRoot -CodexExecutable $CodexExecutable -LaunchStartedAt $LaunchStartedAt -ProxyUri $ProxyUri
+        if (-not $rootProcess) {
+            Write-LauncherLog '无法确认本次启动的后台主进程，未绑定新的监测；已有进程已保留。' 'WARN'
+        }
+    }
+    if ($rootProcess -and -not $NoWatchdog) {
+        Start-ConnectionWatchdog -RootProcessId $rootProcess.Id -CodexExecutable $CodexExecutable -ProxyUri $ProxyUri -ProxyMode $ProxyMode
+        Write-LauncherLog "Connection watchdog started. RootPID=$($rootProcess.Id)"
+        if ($StartupWindow.Status -eq 'TimedOut') {
+            Write-Host '窗口尚未出现，已为确认属于本次启动的后台主进程保留连接监测。'
+        }
+    }
+    Confirm-CodexWindowReady -Result $StartupWindow
 }
 
 function Start-ConnectionWatchdog {
@@ -104,6 +223,7 @@ try {
     Write-Host "Proxy : $proxyUri"
     Write-Host "Codex : $codexExecutable"
 
+    $proxyMode = if ($ProxyServerOverride) { 'Explicit' } else { 'System' }
     if ($DryRun) {
         Write-Host 'DryRun: preflight checks passed; no process was stopped or started.'
         exit 0
@@ -114,8 +234,17 @@ try {
     try { $ownsLaunchMutex = $launchMutex.WaitOne(0) }
     catch [Threading.AbandonedMutexException] { $ownsLaunchMutex = $true }
     if (-not $ownsLaunchMutex) { throw '另一个启动器正在准备或启动 Codex，请稍候；无需重复点击。' }
-    if (@(Get-RunningCodexProcesses -ExecutablePath $codexExecutable -IncludeOtherVersions).Count -gt 0) {
-        Write-Host 'Codex 已经运行，本次未重新启动。若要应用新的代理，请先保存工作并正常退出 Codex。'
+    $windowProgress = {
+        param($progress)
+        Write-Host "正在等待 Codex 窗口，已用 $($progress.ElapsedSeconds) 秒……"
+    }
+    $existingProcesses = @(Get-RunningCodexProcesses -ExecutablePath $codexExecutable -IncludeOtherVersions)
+    if ($existingProcesses.Count -gt 0) {
+        $existingWindow = Open-CodexExistingWindow -GetProcesses {
+            Get-RunningCodexProcesses -ExecutablePath $codexExecutable -IncludeOtherVersions
+        } -RequestActivation { Request-CodexWindowActivation -Processes $existingProcesses } -OnProgress $windowProgress
+        $null = Confirm-CodexWindowReady -Result $existingWindow
+        Write-Host 'Codex 已经运行，窗口已打开。若要应用新的代理，请先保存工作并正常退出 Codex。'
         Write-LauncherLog 'Codex is already running; duplicate launch skipped.'
         exit 0
     }
@@ -142,8 +271,13 @@ try {
     $runtimeCli = Sync-CodexRuntime -CodexExecutable $codexExecutable
     Write-Host "Runtime: $runtimeCli"
     Write-LauncherLog "Preflight passed. Proxy=$proxyUri Codex=$codexExecutable"
-    if (@(Get-RunningCodexProcesses -ExecutablePath $codexExecutable -IncludeOtherVersions).Count -gt 0) {
-        Write-Host '运行环境已准备好，但 Codex 已由其他入口打开；本次未重新启动。'
+    $existingProcesses = @(Get-RunningCodexProcesses -ExecutablePath $codexExecutable -IncludeOtherVersions)
+    if ($existingProcesses.Count -gt 0) {
+        $existingWindow = Open-CodexExistingWindow -GetProcesses {
+            Get-RunningCodexProcesses -ExecutablePath $codexExecutable -IncludeOtherVersions
+        } -RequestActivation { Request-CodexWindowActivation -Processes $existingProcesses } -OnProgress $windowProgress
+        $null = Confirm-CodexWindowReady -Result $existingWindow
+        Write-Host '运行环境已准备好，Codex 已由其他入口打开，窗口已显示。'
         exit 0
     }
 
@@ -156,32 +290,14 @@ try {
 
     Set-Item -Path 'Env:CODEX_CLI_PATH' -Value $runtimeCli
 
+    $launchStartedAt = [datetime]::UtcNow
     $started = Start-Process -FilePath $codexExecutable -ArgumentList "--proxy-server=$proxyUri" -WorkingDirectory (Split-Path $codexExecutable -Parent) -PassThru
-    $startupDeadline = (Get-Date).AddSeconds(20)
-    do {
-        Start-Sleep -Milliseconds 500
-        $running = @(Get-RunningCodexProcesses -ExecutablePath $codexExecutable)
-    } while ($running.Count -eq 0 -and (Get-Date) -lt $startupDeadline)
-    if ($running.Count -eq 0) {
-        throw "Codex 启动后未检测到运行进程（初始 PID：$($started.Id)）。"
-    }
-
-    $rootProcess = $running | Where-Object Id -eq $started.Id | Select-Object -First 1
-    if (-not $rootProcess) {
-        $rootProcess = @($running | Sort-Object @{ Expression = { $_.MainWindowHandle -ne 0 }; Descending = $true }, StartTime | Select-Object -First 1)
-        if ($rootProcess.Count -gt 0) { $rootProcess = $rootProcess[0] }
-    }
-    if (-not $rootProcess) {
-        throw 'Codex 已启动，但无法确定 GPT 主进程，未创建连接监视器。'
-    }
-
-    Write-LauncherLog "Codex started with proxy. PID(s)=$($running.Id -join ',')"
-    if (-not $NoWatchdog) {
-        $proxyMode = if ($ProxyServerOverride) { 'Explicit' } else { 'System' }
-        Start-ConnectionWatchdog -RootProcessId $rootProcess.Id -CodexExecutable $codexExecutable -ProxyUri $proxyUri -ProxyMode $proxyMode
-        Write-LauncherLog "Connection watchdog started. RootPID=$($rootProcess.Id)"
-    }
-    Write-Host 'Codex 已通过当前代理启动。'
+    $startupWindow = Wait-CodexWindow -GetProcesses {
+        Get-RunningCodexProcesses -ExecutablePath $codexExecutable
+    } -OnProgress $windowProgress
+    $rootProcess = Complete-CodexStartup -StartupWindow $startupWindow -CodexExecutable $codexExecutable `
+        -LaunchStartedAt $launchStartedAt -ProxyUri $proxyUri -ProxyMode $proxyMode -NoWatchdog:$NoWatchdog
+    Write-Host 'Codex 窗口已打开，正在使用当前代理。'
     exit 0
 }
 catch {

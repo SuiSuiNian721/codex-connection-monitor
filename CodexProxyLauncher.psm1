@@ -259,7 +259,8 @@ function Sync-CodexRuntime {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$CodexExecutable,
-        [string]$DestinationRoot = (Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\bin')
+        # The app removes other versions from its native bin directory during startup.
+        [string]$DestinationRoot = (Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\launcher-bin')
     )
 
     $ErrorActionPreference = 'Stop'
