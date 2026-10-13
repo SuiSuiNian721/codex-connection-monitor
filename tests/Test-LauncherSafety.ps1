@@ -6,6 +6,11 @@ $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'Launcher has syntax errors.' }
 if ($DuplicateFixture -or $LaunchRaceFixture) {
+    Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'CodexStartup.psm1') -Force
+    $confirmWindow = $ast.Find({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Confirm-CodexWindowReady'
+    }, $true)
+    . ([scriptblock]::Create($confirmWindow.Extent.Text))
     $ProxyServerOverride='127.0.0.1:7890'
     $CodexExecutableOverride=$path
     $DryRun=$false
@@ -18,7 +23,9 @@ if ($DuplicateFixture -or $LaunchRaceFixture) {
     function Get-RunningCodexProcesses {
         param($ExecutablePath,[switch]$IncludeOtherVersions)
         $script:processChecks++
-        if (-not $LaunchRaceFixture -or $script:processChecks -gt 1) { [pscustomobject]@{ Id=999999 } }
+        if (-not $LaunchRaceFixture -or $script:processChecks -gt 1) {
+            [pscustomobject]@{ Id=999999; MainWindowHandle=123; Responding=$true; StartTime=[datetime]'2026-10-13' }
+        }
     }
     function Write-LauncherLog { param($Message,$Level) }
     function Restore-CodexProxyRelay { param($CodexExecutable,$ProxyMode,$InitialProxyUri) $null }

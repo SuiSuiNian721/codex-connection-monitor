@@ -8,6 +8,14 @@ if ($FixtureMode) {
     $errors = $null
     $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
     if ($errors.Count) { throw '启动器语法错误。' }
+    Import-Module (Join-Path $projectRoot 'CodexStartup.psm1') -Force
+    foreach ($name in @('Confirm-CodexWindowReady', 'Complete-CodexStartup')) {
+        $definition = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+        }, $true)
+        if (-not $definition) { throw "缺少启动确认函数：$name" }
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
     $ProxyServerOverride = if ($FixtureMode -eq 'Explicit') { '127.0.0.1:7890' } else { '' }
     $CodexExecutableOverride = $path
     $DryRun = $false
@@ -26,16 +34,16 @@ if ($FixtureMode) {
     function Get-RunningCodexProcesses {
         param($ExecutablePath, [switch]$IncludeOtherVersions)
         $script:processChecks++
-        if ($script:processChecks -gt 2) { [pscustomobject]@{ Id = 54321 } }
+        if ($script:processChecks -gt 2) {
+            [pscustomobject]@{ Id = 54321; MainWindowHandle = 123; Responding = $true; StartTime = [datetime]'2026-10-13' }
+        }
     }
     function Write-LauncherLog { param($Message, $Level) }
     function Sync-CodexCuaRuntime { [pscustomobject]@{ Status = 'Reused'; Validation = 'Full'; Fingerprint = 'fixture'; FileCount = 0; ElapsedSeconds = 0 } }
     function Sync-CodexRuntime { param($CodexExecutable) 'C:\fixture\codex.exe' }
     function Initialize-GenerationCollection {
-        param([string]$RealCliPath, [switch]$Disabled)
-        if ($RealCliPath -ne 'C:\fixture\codex.exe' -or -not $Disabled) {
-            throw '路由夹具必须禁用实时采集，并保留已解析的 CLI 路径。'
-        }
+        param($RealCliPath, [switch]$Disabled)
+        if (-not $Disabled -or $RealCliPath -ne 'C:\fixture\codex.exe') { throw '代理测试必须禁用实时采集且使用虚拟 CLI。' }
         $null
     }
     function Start-CodexProxyRelay {

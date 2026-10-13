@@ -24,10 +24,21 @@
 
 | 版本 | 需要安装 | 下载 |
 |---|---|---|
-| 面板版 2026.10.06-panel | PowerShell 7、Node.js 20+ | [面板版 Windows ZIP](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.06-panel/Codex-Connection-Monitor-Panel-Windows-20261006.zip) |
-| 轻量版 2026.10.02 | PowerShell 7 | [轻量版 Windows ZIP](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.02/Codex-Connection-Monitor-Windows-20261002.zip) |
+| 面板版 2026.10.13-panel | PowerShell 7、Node.js 20+ | [面板版 Windows ZIP](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.13-panel/Codex-Connection-Monitor-Panel-Windows-20261013.zip) |
+| 轻量版 2026.10.13-lite | PowerShell 7 | [轻量版 Windows ZIP](https://github.com/SuiSuiNian721/codex-connection-monitor/releases/download/2026.10.13-lite/Codex-Connection-Monitor-Lite-Windows-20261013.zip) |
 
 两版都需要已安装并登录的 Windows 版 Codex，以及可用的本机系统代理。
+
+## 10 月 13 日修复了什么
+
+- **后台有进程，却看不到窗口**：再次点击启动器时，会请求 Codex 显示已有窗口。
+- **只有进程就提示启动成功**：现在确认窗口可用后才显示“窗口已打开”；等待期间持续显示进度，超时会提示启动未完成。
+- **准备好的缓存被应用清掉**：启动器的 CLI 缓存改放独立目录，同一版本校验通过后继续复用。
+- **窗口启动太慢，后台监测没有跟上**：等待超时后，仍为核实属于本次启动的主进程保留监测。面板版同时保留实时采集接线。
+
+两版都已包含上述启动修复。轻量版继续只做代理启动与连接监视；面板版保留网络诊断、字速、用量和历史数据。使用独立配置目录的窗口，请从该会话原来的入口唤起。
+
+[完整更新说明](docs/2026.10.13-更新说明.md) · [旧版下载](https://github.com/SuiSuiNian721/codex-connection-monitor/releases)
 
 ## 面板版怎么用
 
